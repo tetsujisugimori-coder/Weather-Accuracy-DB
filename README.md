@@ -4,7 +4,7 @@
 
 現在は **Phase 1のみ完成** しています。DBスキーマ、JMA provider、神奈川県の地域階層、観測地点マスタ、`init` / `import-areas` / `status` とそのテストを実装しています。予報・観測値のHTTP取得、parser、精度分析はまだ実装していません。
 
-## 要件とセットアップ
+## 要件とリポジトリからの実行
 
 - Python 3.11以上
 - SQLite（Python標準の `sqlite3` を使用）
@@ -27,6 +27,33 @@ python -m weatherdb --db .\data\practice.sqlite3 status
 
 環境変数 `WEATHERDB_DB_PATH` でも既定パスを変更できます。
 
+## wheel・pip install後の実行
+
+wheelには、Pythonコードに加えてDBスキーマSQLと神奈川県マスタJSONが含まれます。インストール後はリポジトリ外でもコンソールコマンドを実行できます。
+
+wheelのビルド時だけは`pyproject.toml`に記載した`setuptools>=68`が必要です。これはビルド依存であり、インストール後の実行時依存ではありません。
+
+```powershell
+python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
+python -m pip install .\dist\weather_accuracy_db-0.1.0-py3-none-any.whl
+
+New-Item -ItemType Directory -Path C:\weatherdb-work -Force
+Set-Location C:\weatherdb-work
+weatherdb init
+weatherdb import-areas
+weatherdb status
+```
+
+`pip install .` による直接インストールも可能です。Pythonパッケージ以外の実行時依存はありません。
+
+DBパスの優先順位は次のとおりです。
+
+1. CLIの `--db PATH`
+2. 環境変数 `WEATHERDB_DB_PATH`
+3. 実行時カレントディレクトリの `data/weather.sqlite3`
+
+既定値はインストール先ではなく、コマンドを実行したディレクトリを基準にします。読み取り専用の [schema.sql](weatherdb/resources/schema.sql) と [kanagawa.json](weatherdb/resources/kanagawa.json) は`weatherdb.resources`内のパッケージリソースです。書き込み対象のSQLiteとは分離され、`site-packages`内へDBを作成しません。
+
 ## 対象地域と公式データ
 
 地域・地点マスタは2026-08-27に以下の気象庁公式JSONと公式資料を確認して作成しました。詳細と注意事項は [docs/data-sources.md](docs/data-sources.md) にあります。
@@ -44,12 +71,14 @@ python -m weatherdb --db .\data\practice.sqlite3 status
 
 現在登録している `located_in` は地理的な所属の初期対応です。気象庁の公式な精度検証対象地点を意味しません。将来、根拠を確認した検証対象を `verification_target` として別登録できます。
 
+`import-areas`を新しいマスタで再実行すると、`verified_at`を境界日として`located_in`を同期します。消えた現役関係は削除せず`valid_to`を設定し、新しい関係は`valid_from`付きで追加します。一度終了した関係が復活した場合も新しい期間行になります。現役関係だけに部分UNIQUE INDEXを設定するため、同じマスタの再取込では重複しません。`verification_target`はこの同期の対象外です。マスタから消えた観測地点は`active_to`も設定されます。
+
 ## SQLite schema概要
 
 - `providers`: データ提供元。Phase 1は `JMA` のみ。
 - `forecast_areas`: 自己参照外部キーによる地域階層。
 - `observation_stations`: 観測地点、座標、標高、地点種別、観測要素フラグ。
-- `station_area_memberships`: 地点と予報区域の多対多関係。
+- `station_area_memberships`: 地点と予報区域の多対多関係。有効期間ごとに履歴を保持。
 - `forecast_runs`: 取得処理単位。`issued_at` と `fetched_at` を分離し、rawパスとSHA-256を持つ。
 - `forecasts`: 各runに属する予報値。同じ対象日時でもrunが異なれば履歴として共存する。
 - `observations`: 地点・観測日時ごとの生の降水量・気温。
@@ -57,7 +86,20 @@ python -m weatherdb --db .\data\practice.sqlite3 status
 
 主キーはすべてSQLiteの整数キーです。JMAコードにはproviderとの複合UNIQUE制約を置きます。完全に同じraw予報の再取込は `forecast_runs(provider_id, content_sha256)`、同一run内の予報重複は予報の自然キー、観測重複は `(station_id, observed_at)` で防ぐ設計です。一方、発表回の異なる予報は別runなので上書きされません。
 
-スキーマ全文は [sql/schema.sql](sql/schema.sql)、Phase 1のSQL例は [sql/queries.sql](sql/queries.sql) を参照してください。
+スキーマ全文はパッケージ内の [weatherdb/resources/schema.sql](weatherdb/resources/schema.sql)、Phase 1のSQL例は [sql/queries.sql](sql/queries.sql) を参照してください。
+
+### 既存Phase 1 DBの再作成
+
+この修正では`station_area_memberships`のUNIQUE制約・有効期間必須化・部分INDEXと、`forecasts`の期間CHECKを変更しました。マイグレーション機能はまだないため、コミット`46c2086`で作成したDBはバックアップへ移動して再作成してください。
+
+```powershell
+Move-Item -LiteralPath .\data\weather.sqlite3 -Destination .\data\weather.phase1-backup.sqlite3
+python -m weatherdb init
+python -m weatherdb import-areas
+python -m weatherdb status
+```
+
+必要なユーザーデータが入っている場合は削除せず、バックアップを保持してください。
 
 ## 時刻の扱い
 
@@ -77,7 +119,7 @@ Phase 2以降では、取得時刻と種別を含む名前で `raw/jma/` 以下�
 
 各接続で `PRAGMA foreign_keys = ON` と5秒のbusy timeoutを設定します。WALは、将来の定期取得中にも読み取り分析しやすく、異常終了時の耐性も得やすいため採用しています。代わりに `-wal` / `-shm` ファイルが生じ、ネットワーク共有には向かないため、DBはローカルディスクで使ってください。
 
-日時、予報区域、地域親子関係と中間テーブルの検索に必要なINDEXだけを定義しています。`forecasts.forecast_run_id` と `observations.station_id` は、それぞれ先頭列に含むUNIQUE制約の自動INDEXを利用するため、重複する単一列INDEXは作りません。`sql/queries.sql` に `EXPLAIN QUERY PLAN` の例があります。
+日時、予報区域、地域親子関係と中間テーブルの検索に必要なINDEXだけを定義しています。現役の地点―区域関係には`idx_station_memberships_active`部分UNIQUE INDEXを使います。`forecasts.forecast_run_id` と `observations.station_id` は、それぞれ先頭列に含むUNIQUE制約のSQLite自動INDEXを利用するため、重複する単一列INDEXは作りません。`sql/queries.sql` に `EXPLAIN QUERY PLAN` の例があります。
 
 ## テストとDB検証
 
@@ -95,9 +137,9 @@ python -c "import sqlite3; c=sqlite3.connect('data/weather.sqlite3'); print(c.ex
 ## 現在の制約
 
 - Phase 1のため予報・観測データはまだ取得しない。
-- 地域・地点マスタは確認日のスナップショットで、自動同期しない。
+- 地域・地点マスタは確認日のスナップショットで、気象庁サイトからの自動更新は行わない。
 - `located_in` は地理的対応で、公式な検証対象地点リストではない。
-- 観測所の正確な設置・廃止履歴はまだ取り込んでいないため `active_from` / `active_to` はNULL。
+- 観測地点テーブル自体は1行/地点のため、廃止後に同じ地点が復活した場合の地点履歴全体は保持しない。地点―区域関係の期間履歴は保持する。
 - 日別観測値、降水判定、気温誤差、calibrationは未実装。
 
 ## 次のPhase

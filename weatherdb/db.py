@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
-
-from weatherdb.config import SCHEMA_PATH
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -22,7 +21,7 @@ def connect(path: Path) -> sqlite3.Connection:
 def initialize(path: Path) -> None:
     """Create the database idempotently and register the JMA provider."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    schema = SCHEMA_PATH.read_text(encoding="utf-8")
+    schema = files("weatherdb.resources").joinpath("schema.sql").read_text(encoding="utf-8")
     connection = connect(path)
     try:
         connection.executescript(schema)
@@ -84,4 +83,3 @@ def database_status(path: Path) -> dict[str, Any]:
         }
     finally:
         connection.close()
-

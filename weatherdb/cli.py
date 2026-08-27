@@ -16,16 +16,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m weatherdb",
         description="気象庁の予報精度検証DB（Phase 1）",
+        epilog=(
+            "DB既定値は実行時カレントディレクトリの data/weather.sqlite3。"
+            "優先順位は --db、WEATHERDB_DB_PATH、既定値です。"
+        ),
     )
     parser.add_argument(
         "--db",
         type=Path,
         default=database_path(),
-        help="SQLiteファイル（既定: data/weather.sqlite3）",
+        help=(
+            "SQLiteファイル（未指定時は WEATHERDB_DB_PATH、さらに未指定なら"
+            "実行時カレントディレクトリの data/weather.sqlite3）"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="DBスキーマとJMA providerを初期化")
-    subparsers.add_parser("import-areas", help="神奈川県の地域・観測地点マスタを登録")
+    import_parser = subparsers.add_parser(
+        "import-areas", help="神奈川県の地域・観測地点マスタを登録"
+    )
+    import_parser.add_argument(
+        "--master",
+        type=Path,
+        help="検証・再取込用のマスタJSON（未指定時はwheel同梱リソース）",
+    )
     subparsers.add_parser("status", help="DB状態を表示")
     return parser
 
@@ -63,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise FileNotFoundError("DBがありません。先に init を実行してください")
             connection = connect(path)
             try:
-                areas, stations = import_kanagawa_master(connection)
+                areas, stations = import_kanagawa_master(connection, args.master)
             finally:
                 connection.close()
             print(f"地域・観測地点マスタを登録しました: 地域 {areas}件 / 観測地点 {stations}件")
@@ -75,4 +89,3 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, sqlite3.Error, MasterDataError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
-

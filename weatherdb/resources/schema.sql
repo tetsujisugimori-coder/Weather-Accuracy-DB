@@ -1,3 +1,4 @@
+-- Read-only schema resource bundled with the weatherdb package.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS providers (
@@ -51,11 +52,11 @@ CREATE TABLE IF NOT EXISTS station_area_memberships (
     station_id INTEGER NOT NULL REFERENCES observation_stations(id) ON DELETE CASCADE,
     forecast_area_id INTEGER NOT NULL REFERENCES forecast_areas(id) ON DELETE CASCADE,
     relation_type TEXT NOT NULL DEFAULT 'located_in' CHECK (relation_type IN ('located_in', 'verification_target')),
-    valid_from TEXT,
+    valid_from TEXT NOT NULL,
     valid_to TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (station_id, forecast_area_id, relation_type),
-    CHECK (valid_to IS NULL OR valid_from IS NULL OR valid_to > valid_from)
+    UNIQUE (station_id, forecast_area_id, relation_type, valid_from),
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
 );
 
 CREATE TABLE IF NOT EXISTS forecast_runs (
@@ -85,7 +86,8 @@ CREATE TABLE IF NOT EXISTS forecasts (
     high_temperature REAL,
     low_temperature REAL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (forecast_run_id, forecast_area_id, target_start, target_end, forecast_type)
+    UNIQUE (forecast_run_id, forecast_area_id, target_start, target_end, forecast_type),
+    CHECK (target_end > target_start)
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -109,6 +111,9 @@ CREATE TABLE IF NOT EXISTS master_imports (
 
 CREATE INDEX IF NOT EXISTS idx_forecast_areas_parent ON forecast_areas(parent_area_id);
 CREATE INDEX IF NOT EXISTS idx_station_memberships_area ON station_area_memberships(forecast_area_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_station_memberships_active
+    ON station_area_memberships(station_id, forecast_area_id, relation_type)
+    WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_issued_at ON forecast_runs(issued_at);
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_fetched_at ON forecast_runs(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_forecasts_target_start ON forecasts(target_start);
