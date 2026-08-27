@@ -1,0 +1,91 @@
+# 気象庁公式データ調査（Phase 1）
+
+確認日: 2026-08-27（日本時間）
+
+この文書では、気象庁公式サイトで現在確認できる情報だけを採用候補として整理する。気象庁ホームページ表示用JSONは便利だが、バージョン固定された公開API仕様ではない。将来の構造変更を前提に、取得時のrawファイルを保存し、parserをfixtureで検証する方針とする。
+
+## 地域コードと階層
+
+- URL: <https://www.jma.go.jp/bosai/common/const/area.json>
+- 内容: 気象庁防災情報ページの地域マスタ。`offices`、`class10s`、`class15s`、`class20s` にコード、名称、親、子を収録する。
+- 更新頻度: 地域区分改定時。定時更新頻度は明記されていない。
+- 注意事項: JSON構造の安定性は保証されない。`master/kanagawa.json` は確認日のスナップショットであり、Pythonコードには大量の地域名を埋め込まない。
+
+神奈川県の構造は次のとおりだった。
+
+| 気象庁JSON区分 | 本DBの `area_level` | コード・名称 |
+|---|---|---|
+| `offices` | `prefecture` | `140000` 神奈川県 |
+| `class10s` | `primary` | `140010` 東部、`140020` 西部 |
+| `class15s` | `grouped_municipality` | `140011` 横浜・川崎、`140012` 湘南、`140013` 三浦半島、`140021` 相模原、`140022` 県央、`140023` 足柄上、`140024` 西湘 |
+| `class20s` | `municipality` | 横浜市・相模原市の分割を含む35区域 |
+
+`offices` は厳密には府県予報区等の発表単位であり、行政上の都道府県そのものと常に同義とは限らない。このプロトタイプでは神奈川県 `140000` を階層の根として扱う。
+
+## 神奈川県内の観測地点
+
+- URL: <https://www.jma.go.jp/bosai/amedas/const/amedastable.json>
+- 公式解説: <https://www.jma.go.jp/jma/kishou/know/amedas/kaisetsu.html>
+- 公式地点情報案内: <https://ds.data.jma.go.jp/stats/data/mdrr/man/kansoku_gaiyou.html>
+- 地域気象観測所一覧フォーマット: <https://www.data.jma.go.jp/suishin/catalogue/format/ObdObs_Amedas_ObsList_format.pdf>
+- 内容: 現行地点番号、種類、観測要素フラグ、緯度・経度、標高、和英名称。
+- 更新頻度: 観測所の新設・廃止・移転等に応じて更新。定時更新頻度は明記されていない。
+- 注意事項: 地点番号上位2桁は都府県・振興局表示番号。確認時点で神奈川県 `46xxx` の現行地点は11地点だった。地点ごとに観測要素が異なり、降水のみの地点もある。
+
+| 地点番号 | 地点名 | 種類 | 気温を含む要素フラグか |
+|---|---|---:|---:|
+| 46001 | 相模湖 | C | いいえ |
+| 46046 | 相模原中央 | C | いいえ |
+| 46061 | 日吉 | C | いいえ |
+| 46076 | 丹沢湖 | C | いいえ |
+| 46091 | 海老名 | C | はい |
+| 46106 | 横浜 | A | はい |
+| 46136 | 平塚 | C | いいえ |
+| 46141 | 辻堂 | C | はい |
+| 46161 | 箱根 | C | いいえ |
+| 46166 | 小田原 | C | はい |
+| 46211 | 三浦 | C | はい |
+
+地点と `class15s` の関係は公式JSONに直接含まれない。本マスタの `located_in` 対応は地点座標と市町村等をまとめた区域を照合した初期対応であり、気象庁が精度検証に使う公式な対象地点指定とは断定しない。このためDBは中間テーブルと有効期間を持ち、Phase 4で検証対象関係を別の `relation_type` として登録できる。
+
+## 府県天気予報JSON
+
+- 神奈川県URL: <https://www.jma.go.jp/bosai/forecast/data/forecast/140000.json>
+- 表示ページ: <https://www.jma.go.jp/bosai/forecast/>
+- 内容: 確認時点では配列に短期予報と週間予報の2文書があり、各文書に `publishingOffice`、`reportDatetime`、`timeSeries` がある。短期予報は東部・西部の天気コード・天気文・6時間ごとの降水確率と、横浜・小田原の気温を含む。週間予報は神奈川県単位の天気コード・降水確率と横浜の最高・最低気温等を含む。
+- 更新頻度: 府県天気予報は通常5時・11時・17時の1日3回。必要時に修正されることがある。
+- 注意事項: `reportDatetime`（発表日時）とHTTP取得時刻は別物。配列位置だけに依存せず、キーと地域コードを検証する必要がある。Phase 2で実装する。
+
+## 地域時系列予報
+
+- 解説: <https://www.jma.go.jp/jma/kishou/know/kurashi/jikeiretsu.html>
+- 情報カタログ: <https://www.data.jma.go.jp/suishin/cgi-bin/catalogue/make_product_page.cgi?id=Jikeiret>
+- 内容: 一次細分区域単位で、明日24時までの卓越天気・風・気温を3時間単位で提供する。気温は一次細分区域内の特定地点の値。
+- 更新頻度: 通常5時・11時・17時の1日3回。
+- 注意事項: 府県天気予報JSONの6時間降水確率と、地域時系列予報の3時間要素を混同しない。Phase 2で取得元と意味を保持してモデル化する。
+
+## 降水確率と気温
+
+- FAQ: <https://www.jma.go.jp/jma/kishou/know/faq/faq4.html>
+- 内容: 降水確率は、指定時間帯に予報区域内のある地点で1mm以上の降水がある確率。府県天気予報JSONでは短期の降水確率が6時間単位、最高・最低気温は代表地点単位で提供される。
+- 注意事項: 降水確率50%を二値の当たり・外れとして扱わない。区域の降水確率と観測地点一致率も別概念である。
+
+## 観測値の取得候補
+
+- 高度利用ポータル: <https://www.data.jma.go.jp/developer/weatherdataguide/appendix/1-1-a.html>
+- 過去の気象データ検索: <https://www.data.jma.go.jp/stats/etrn/index.php>
+- 更新時刻: <https://ds.data.jma.go.jp/stats/data/mdrr/man/update_k.html>
+- ホームページ表示用地点表: <https://www.jma.go.jp/bosai/amedas/const/amedastable.json>
+- ホームページ表示用最新時刻: <https://www.jma.go.jp/bosai/amedas/data/latest_time.txt>
+- 内容: アメダスでは降水量、気温等を地点ごとに観測し、要素は地点により異なる。過去検索では日・時間・10分値を参照できる。ホームページ表示用JSONでは最近の観測を時刻別ファイルで表示している。
+- 更新頻度: アメダス表示は10分単位。過去データ検索への反映時刻は公式更新案内に従う。
+- 単位: 降水量 mm、気温 ℃。品質情報・欠測を値と分離して扱う必要がある。
+- 注意事項: ホームページ表示用JSONは長期アーカイブAPIではない。Phase 3で利用条件、過去値の再取得方法、品質フラグ、日別集計方法をfixtureとともに確定する。
+
+## 気象庁の精度検証方法
+
+- URL: <https://www.data.jma.go.jp/yoho/kensho/explanation.html>
+- 内容: 雨の実況は1mm以上を「降水あり」とする（雪は0.5mm以上）。降水確率は10%刻みの階級ごとに、対象時間の1mm以上の降水出現率を集計して検証する。予報区内の複数アメダス地点を個別判定して区域内平均する考え方も説明されている。
+- 更新頻度: 解説は方式変更時、公開検証結果は月次。
+- 注意事項: 雪の0.5mm基準を初版の雨判定へ無条件適用しない。閾値は将来の分析関数の引数または設定にする。Phase 1では判定値をDBに保存しない。
+

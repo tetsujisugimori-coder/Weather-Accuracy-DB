@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weather-accuracy-db"
+version = "0.1.0"
+description = "JMA weather forecast accuracy database prototype for Kanagawa"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+weatherdb = "weatherdb.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["weatherdb*"]
+
