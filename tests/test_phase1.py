@@ -3,8 +3,8 @@ from __future__ import annotations
 import contextlib
 import io
 import sqlite3
+import tempfile
 import unittest
-import uuid
 from pathlib import Path
 
 from weatherdb.cli import main
@@ -14,14 +14,13 @@ from weatherdb.importers.areas import import_kanagawa_master
 
 class Phase1DatabaseTests(unittest.TestCase):
     def setUp(self) -> None:
-        test_data = Path(__file__).resolve().parent / "testdata"
-        self.db_path = test_data / f"weather-{uuid.uuid4().hex}.sqlite3"
+        self.temporary_directory = tempfile.TemporaryDirectory(
+            prefix="weatherdb-phase1-"
+        )
+        self.db_path = Path(self.temporary_directory.name) / "weather.sqlite3"
 
     def tearDown(self) -> None:
-        for suffix in ("", "-wal", "-shm"):
-            candidate = Path(f"{self.db_path}{suffix}")
-            if candidate.exists():
-                candidate.unlink()
+        self.temporary_directory.cleanup()
 
     def initialize_and_import(self) -> sqlite3.Connection:
         initialize(self.db_path)

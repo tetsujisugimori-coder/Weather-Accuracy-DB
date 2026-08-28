@@ -7,4 +7,9 @@ data/*.sqlite3
 data/*.sqlite3-*
 raw/
 tests/testdata/*.sqlite3*
+tests/testdata/*.json
 tests/.tmp/
+build/
+dist/
+*.egg-info/
+*.whl

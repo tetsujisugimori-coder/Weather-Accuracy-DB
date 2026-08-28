@@ -15,3 +15,5 @@ weatherdb = "weatherdb.cli:main"
 [tool.setuptools.packages.find]
 include = ["weatherdb*"]
 
+[tool.setuptools.package-data]
+"weatherdb.resources" = ["*.sql", "*.json"]
