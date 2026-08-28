@@ -4,8 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
-import uuid
 import zipfile
 from pathlib import Path
 
@@ -13,14 +13,13 @@ from pathlib import Path
 class WheelPackagingTests(unittest.TestCase):
     def test_wheel_resources_and_installed_cli_outside_repository(self) -> None:
         repository = Path(__file__).resolve().parent.parent
-        workspace = repository.parent / f".weatherdb-wheel-test-{uuid.uuid4().hex}"
-        source = workspace / "source"
-        distribution = workspace / "dist"
-        installation = workspace / "installation"
-        runtime = workspace / "runtime"
-        temporary = workspace / "temp"
-        workspace.mkdir()
-        try:
+        with tempfile.TemporaryDirectory(prefix="weatherdb-wheel-test-") as directory:
+            workspace = Path(directory)
+            source = workspace / "source"
+            distribution = workspace / "dist"
+            installation = workspace / "installation"
+            runtime = workspace / "runtime"
+            temporary = workspace / "temp"
             shutil.copytree(
                 repository,
                 source,
@@ -43,6 +42,8 @@ class WheelPackagingTests(unittest.TestCase):
             offline_environment["TEMP"] = str(temporary)
             offline_environment["TMP"] = str(temporary)
             offline_environment["TMPDIR"] = str(temporary)
+            offline_environment["PYTHONUTF8"] = "1"
+            offline_environment["PYTHONIOENCODING"] = "utf-8"
             offline_environment.pop("PYTHONPATH", None)
             build_result = subprocess.run(
                 [
@@ -122,9 +123,6 @@ class WheelPackagingTests(unittest.TestCase):
             self.assertIn("地域 45件 / 観測地点 11件", outputs[1])
             self.assertIn("登録地域数: 45", outputs[2])
             self.assertIn("観測地点数: 11", outputs[2])
-        finally:
-            if workspace.exists():
-                shutil.rmtree(workspace)
 
 
 if __name__ == "__main__":

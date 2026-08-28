@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -12,6 +13,7 @@ from typing import Any
 
 
 AREA_LEVELS = {"prefecture", "primary", "grouped_municipality", "municipality"}
+MASTER_NAME = "kanagawa-phase1"
 
 
 class MasterDataError(ValueError):
@@ -69,9 +71,24 @@ def _optional_date_range(record: dict[str, Any], prefix: str, label: str) -> Non
 def _coordinate(value: Any, label: str, minimum: float, maximum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MasterDataError(f"{label} は数値である必要があります")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise MasterDataError(f"{label} は有限の数値である必要があります") from exc
     if not math.isfinite(number) or not minimum <= number <= maximum:
         raise MasterDataError(f"{label} は{minimum:g}以上{maximum:g}以下である必要があります")
+    return number
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MasterDataError(f"{label} は有限の数値である必要があります")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise MasterDataError(f"{label} は有限の数値である必要があります") from exc
+    if not math.isfinite(number):
+        raise MasterDataError(f"{label} は有限の数値である必要があります")
     return number
 
 
@@ -140,12 +157,7 @@ def _validate_master(data: Any) -> None:
         _coordinate(station.get("longitude"), f"{label}.longitude", -180, 180)
         elevation = station.get("elevation")
         if elevation is not None:
-            if (
-                isinstance(elevation, bool)
-                or not isinstance(elevation, (int, float))
-                or not math.isfinite(float(elevation))
-            ):
-                raise MasterDataError(f"{label}.elevation は有限の数値である必要があります")
+            _finite_number(elevation, f"{label}.elevation")
         _optional_date_range(station, "active", label)
 
         station_areas = station.get("area_codes")
@@ -170,8 +182,70 @@ def validate_master(data: Any) -> None:
         _validate_master(data)
     except MasterDataError:
         raise
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+    except (AttributeError, KeyError, OverflowError, TypeError, ValueError) as exc:
         raise MasterDataError(f"地域マスタの構造が不正です: {exc}") from exc
+
+
+def _master_content_sha256(data: dict[str, Any]) -> str:
+    """Hash only validated importer inputs in a deterministic representation."""
+    normalized_areas = []
+    for area in sorted(data["areas"], key=lambda item: item["area_code"]):
+        normalized_areas.append(
+            {
+                "area_code": area["area_code"],
+                "name": area["name"],
+                "name_en": area.get("name_en"),
+                "parent_area_code": area.get("parent_area_code"),
+                "area_level": area["area_level"],
+                "valid_from": area.get("valid_from"),
+                "valid_to": area.get("valid_to"),
+            }
+        )
+
+    normalized_stations = []
+    for station in sorted(data["stations"], key=lambda item: item["station_code"]):
+        elevation = station.get("elevation")
+        normalized_stations.append(
+            {
+                "station_code": station["station_code"],
+                "name": station["name"],
+                "name_en": station.get("name_en"),
+                "station_type": station.get("station_type"),
+                "element_flags": station.get("element_flags"),
+                "latitude": _coordinate(
+                    station["latitude"], "station.latitude", -90, 90
+                ),
+                "longitude": _coordinate(
+                    station["longitude"], "station.longitude", -180, 180
+                ),
+                "elevation": (
+                    _finite_number(elevation, "station.elevation")
+                    if elevation is not None
+                    else None
+                ),
+                "active_from": station.get("active_from"),
+                "active_to": station.get("active_to"),
+                "area_codes": sorted(station["area_codes"]),
+            }
+        )
+
+    normalized = {
+        "verified_at": data["verified_at"],
+        "sources": {
+            "areas": data["sources"]["areas"],
+            "stations": data["sources"]["stations"],
+        },
+        "areas": normalized_areas,
+        "stations": normalized_stations,
+    }
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _ordered_areas(areas: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -199,13 +273,53 @@ def import_kanagawa_master(
 ) -> tuple[int, int]:
     """Synchronize the versioned master atomically and return JMA totals."""
     data = load_master(path)
-    provider = connection.execute("SELECT id FROM providers WHERE code = 'JMA'").fetchone()
-    if provider is None:
-        raise MasterDataError("JMA provider がありません。先に init を実行してください")
-    provider_id = provider[0]
     verified_at = data["verified_at"]
+    content_sha256 = _master_content_sha256(data)
 
-    with connection:
+    if connection.in_transaction:
+        raise MasterDataError("未完了のトランザクションがあるためマスタを取り込めません")
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        provider = connection.execute(
+            "SELECT id FROM providers WHERE code = 'JMA'"
+        ).fetchone()
+        if provider is None:
+            raise MasterDataError("JMA provider がありません。先に init を実行してください")
+        provider_id = provider[0]
+
+        latest = connection.execute(
+            """
+            SELECT verified_at, content_sha256
+            FROM master_imports
+            WHERE master_name = ?
+            ORDER BY verified_at DESC
+            LIMIT 1
+            """,
+            (MASTER_NAME,),
+        ).fetchone()
+        if latest is not None and verified_at < latest["verified_at"]:
+            raise MasterDataError(
+                f"古いマスタは取り込めません: 今回 {verified_at} / "
+                f"取込済み最新 {latest['verified_at']}"
+            )
+        if latest is not None and verified_at == latest["verified_at"]:
+            if content_sha256 != latest["content_sha256"]:
+                raise MasterDataError(
+                    f"同じ確認日のマスタ内容が一致しません: {verified_at}"
+                )
+            area_count = connection.execute(
+                "SELECT COUNT(*) FROM forecast_areas WHERE provider_id = ?",
+                (provider_id,),
+            ).fetchone()[0]
+            station_count = connection.execute(
+                "SELECT COUNT(*) FROM observation_stations WHERE provider_id = ?",
+                (provider_id,),
+            ).fetchone()[0]
+            connection.commit()
+            return area_count, station_count
+
+        current_area_codes = {area["area_code"] for area in data["areas"]}
         for area in _ordered_areas(data["areas"]):
             parent_id = None
             if area.get("parent_area_code"):
@@ -243,12 +357,72 @@ def import_kanagawa_master(
                 ),
             )
 
+        active_areas = connection.execute(
+            """
+            SELECT id, area_code, valid_from
+            FROM forecast_areas
+            WHERE provider_id = ? AND valid_to IS NULL
+            """,
+            (provider_id,),
+        ).fetchall()
+        for area in active_areas:
+            if area["area_code"] in current_area_codes:
+                continue
+            if area["valid_from"] is not None and verified_at <= area["valid_from"]:
+                raise MasterDataError(
+                    "地域の終了日は開始日より後である必要があります: "
+                    f"{area['area_code']}"
+                )
+            connection.execute(
+                """
+                UPDATE forecast_areas
+                SET valid_to = ?, master_verified_at = ?
+                WHERE id = ? AND valid_to IS NULL
+                """,
+                (verified_at, verified_at, area["id"]),
+            )
+
         desired_memberships: set[tuple[str, str]] = set()
         current_station_codes: set[str] = set()
+        retired_station_ends: dict[str, str] = {}
+        membership_starts: dict[str, str] = {}
         for station in data["stations"]:
             station_code = station["station_code"]
             current_station_codes.add(station_code)
-            active_from = station.get("active_from") or verified_at
+            active_to = station.get("active_to")
+            is_retired = active_to is not None and active_to <= verified_at
+            existing = connection.execute(
+                """
+                SELECT active_from, active_to
+                FROM observation_stations
+                WHERE provider_id = ? AND station_code = ?
+                """,
+                (provider_id, station_code),
+            ).fetchone()
+
+            if existing is None:
+                active_from = (
+                    station.get("active_from")
+                    if is_retired
+                    else station.get("active_from") or verified_at
+                )
+            elif is_retired:
+                active_from = station.get("active_from") or existing["active_from"]
+            elif existing["active_to"] is not None:
+                active_from = station.get("active_from") or verified_at
+            else:
+                active_from = (
+                    existing["active_from"]
+                    or station.get("active_from")
+                    or verified_at
+                )
+
+            if active_to is not None and active_from is not None and active_to <= active_from:
+                raise MasterDataError(
+                    "観測地点の終了日は開始日より後である必要があります: "
+                    f"{station_code}"
+                )
+
             connection.execute(
                 """
                 INSERT INTO observation_stations
@@ -264,10 +438,7 @@ def import_kanagawa_master(
                   latitude = excluded.latitude,
                   longitude = excluded.longitude,
                   elevation = excluded.elevation,
-                  active_from = CASE
-                    WHEN observation_stations.active_to IS NOT NULL THEN excluded.active_from
-                    ELSE observation_stations.active_from
-                  END,
+                  active_from = excluded.active_from,
                   active_to = excluded.active_to,
                   source_url = excluded.source_url,
                   master_verified_at = excluded.master_verified_at
@@ -279,39 +450,59 @@ def import_kanagawa_master(
                     station.get("name_en"),
                     station.get("station_type"),
                     station.get("element_flags"),
-                    station["latitude"],
-                    station["longitude"],
-                    station.get("elevation"),
+                    _coordinate(station["latitude"], "station.latitude", -90, 90),
+                    _coordinate(
+                        station["longitude"], "station.longitude", -180, 180
+                    ),
+                    (
+                        _finite_number(station["elevation"], "station.elevation")
+                        if station.get("elevation") is not None
+                        else None
+                    ),
                     active_from,
-                    station.get("active_to"),
+                    active_to,
                     data["sources"]["stations"],
                     verified_at,
                 ),
             )
-            desired_memberships.update(
-                (station_code, area_code) for area_code in station["area_codes"]
-            )
+            if is_retired:
+                retired_station_ends[station_code] = active_to
+            else:
+                desired_memberships.update(
+                    (station_code, area_code) for area_code in station["area_codes"]
+                )
+                membership_starts[station_code] = (
+                    active_from
+                    if existing is not None and existing["active_to"] is not None
+                    else verified_at
+                )
 
-        if current_station_codes:
-            placeholders = ", ".join("?" for _ in current_station_codes)
-            connection.execute(
-                f"""
-                UPDATE observation_stations
-                SET active_to = ?, master_verified_at = ?
-                WHERE provider_id = ?
-                  AND active_to IS NULL
-                  AND station_code NOT IN ({placeholders})
-                """,
-                (verified_at, verified_at, provider_id, *sorted(current_station_codes)),
-            )
-        else:
+        active_stations = connection.execute(
+            """
+            SELECT id, station_code, active_from
+            FROM observation_stations
+            WHERE provider_id = ? AND active_to IS NULL
+            """,
+            (provider_id,),
+        ).fetchall()
+        for station in active_stations:
+            if station["station_code"] in current_station_codes:
+                continue
+            if (
+                station["active_from"] is not None
+                and verified_at <= station["active_from"]
+            ):
+                raise MasterDataError(
+                    "観測地点の終了日は開始日より後である必要があります: "
+                    f"{station['station_code']}"
+                )
             connection.execute(
                 """
                 UPDATE observation_stations
                 SET active_to = ?, master_verified_at = ?
-                WHERE provider_id = ? AND active_to IS NULL
+                WHERE id = ? AND active_to IS NULL
                 """,
-                (verified_at, verified_at, provider_id),
+                (verified_at, verified_at, station["id"]),
             )
 
         active_rows = connection.execute(
@@ -332,16 +523,18 @@ def import_kanagawa_master(
         }
 
         for key, row in active_keys.items():
-            if key not in desired_memberships:
-                if verified_at <= row["valid_from"]:
-                    raise MasterDataError(
-                        "関係の終了日は開始日より後である必要があります: "
-                        f"{key[0]} -> {key[1]}"
-                    )
-                connection.execute(
-                    "UPDATE station_area_memberships SET valid_to = ? WHERE id = ?",
-                    (verified_at, row["id"]),
+            if key in desired_memberships:
+                continue
+            close_at = retired_station_ends.get(key[0], verified_at)
+            if close_at <= row["valid_from"]:
+                raise MasterDataError(
+                    "関係の終了日は開始日より後である必要があります: "
+                    f"{key[0]} -> {key[1]}"
                 )
+            connection.execute(
+                "UPDATE station_area_memberships SET valid_to = ? WHERE id = ?",
+                (close_at, row["id"]),
+            )
 
         for station_code, area_code in sorted(desired_memberships):
             if (station_code, area_code) in active_keys:
@@ -360,23 +553,27 @@ def import_kanagawa_master(
                   (station_id, forecast_area_id, relation_type, valid_from, valid_to)
                 VALUES (?, ?, 'located_in', ?, NULL)
                 """,
-                (station_id, area_id, verified_at),
+                (station_id, area_id, membership_starts[station_code]),
             )
 
         connection.execute(
             """
-            INSERT INTO master_imports (master_name, source_url, verified_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(master_name, verified_at) DO NOTHING
+            INSERT INTO master_imports
+              (master_name, source_url, verified_at, content_sha256)
+            VALUES (?, ?, ?, ?)
             """,
-            ("kanagawa-phase1", data["sources"]["areas"], verified_at),
+            (MASTER_NAME, data["sources"]["areas"], verified_at, content_sha256),
         )
-
-    area_count = connection.execute(
-        "SELECT COUNT(*) FROM forecast_areas WHERE provider_id = ?", (provider_id,)
-    ).fetchone()[0]
-    station_count = connection.execute(
-        "SELECT COUNT(*) FROM observation_stations WHERE provider_id = ?", (provider_id,)
-    ).fetchone()[0]
-    return area_count, station_count
-
+        area_count = connection.execute(
+            "SELECT COUNT(*) FROM forecast_areas WHERE provider_id = ?",
+            (provider_id,),
+        ).fetchone()[0]
+        station_count = connection.execute(
+            "SELECT COUNT(*) FROM observation_stations WHERE provider_id = ?",
+            (provider_id,),
+        ).fetchone()[0]
+        connection.commit()
+        return area_count, station_count
+    except Exception:
+        connection.rollback()
+        raise

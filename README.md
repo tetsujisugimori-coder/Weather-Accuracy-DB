@@ -71,7 +71,9 @@ DBパスの優先順位は次のとおりです。
 
 現在登録している `located_in` は地理的な所属の初期対応です。気象庁の公式な精度検証対象地点を意味しません。将来、根拠を確認した検証対象を `verification_target` として別登録できます。
 
-`import-areas`を新しいマスタで再実行すると、`verified_at`を境界日として`located_in`を同期します。消えた現役関係は削除せず`valid_to`を設定し、新しい関係は`valid_from`付きで追加します。一度終了した関係が復活した場合も新しい期間行になります。現役関係だけに部分UNIQUE INDEXを設定するため、同じマスタの再取込では重複しません。`verification_target`はこの同期の対象外です。マスタから消えた観測地点は`active_to`も設定されます。
+`import-areas`を新しいマスタで再実行すると、`verified_at`を境界日として地域・地点・`located_in`を同期します。マスタは`verified_at`の古い順に取り込み、取込済みの最新日より古いマスタは拒否します。同じ日付は、検証済みデータについてJSONオブジェクトのキー、地域・地点、各地点の`area_codes`を決定的な順序へ正規化したSHA-256が一致する場合だけ再取込できます。
+
+マスタから消えた現役地域は物理削除せず、今回の`verified_at`を`valid_to`として終了します。消えた現役関係も同様に履歴を残し、新しい関係は`valid_from`付きで追加します。一度終了した地点が復活した場合は、地点の`active_from`と`located_in`の新しい期間を開始します。`active_to`を持つ廃止地点は、その`active_to`と同じ日付で現役`located_in`を閉じます。`verification_target`はこの同期の対象外です。
 
 ## SQLite schema概要
 
@@ -82,7 +84,7 @@ DBパスの優先順位は次のとおりです。
 - `forecast_runs`: 取得処理単位。`issued_at` と `fetched_at` を分離し、rawパスとSHA-256を持つ。
 - `forecasts`: 各runに属する予報値。同じ対象日時でもrunが異なれば履歴として共存する。
 - `observations`: 地点・観測日時ごとの生の降水量・気温。
-- `master_imports`: どの確認日のマスタをimportしたかを記録。
+- `master_imports`: どの確認日のマスタをimportしたかと、正規化内容のSHA-256を記録。
 
 主キーはすべてSQLiteの整数キーです。JMAコードにはproviderとの複合UNIQUE制約を置きます。完全に同じraw予報の再取込は `forecast_runs(provider_id, content_sha256)`、同一run内の予報重複は予報の自然キー、観測重複は `(station_id, observed_at)` で防ぐ設計です。一方、発表回の異なる予報は別runなので上書きされません。
 
@@ -90,7 +92,7 @@ DBパスの優先順位は次のとおりです。
 
 ### 既存Phase 1 DBの再作成
 
-この修正では`station_area_memberships`のUNIQUE制約・有効期間必須化・部分INDEXと、`forecasts`の期間CHECKを変更しました。マイグレーション機能はまだないため、コミット`46c2086`で作成したDBはバックアップへ移動して再作成してください。
+この修正では`station_area_memberships`のUNIQUE制約・有効期間必須化・部分INDEX、`forecasts`の期間CHECKに加え、`master_imports.content_sha256`を追加しました。中途半端な自動マイグレーションは行いません。以前のPhase 1スキーマで作成したDBはバックアップへ移動して再作成してください。
 
 ```powershell
 Move-Item -LiteralPath .\data\weather.sqlite3 -Destination .\data\weather.phase1-backup.sqlite3

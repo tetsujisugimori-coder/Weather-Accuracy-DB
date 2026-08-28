@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS master_imports (
     master_name TEXT NOT NULL,
     source_url TEXT NOT NULL,
     verified_at TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
     imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (master_name, verified_at)
 );
