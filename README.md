@@ -73,7 +73,9 @@ DBパスの優先順位は次のとおりです。
 
 `import-areas`を新しいマスタで再実行すると、`verified_at`を境界日として地域・地点・`located_in`を同期します。マスタは`verified_at`の古い順に取り込み、取込済みの最新日より古いマスタは拒否します。同じ日付は、検証済みデータについてJSONオブジェクトのキー、地域・地点、各地点の`area_codes`を決定的な順序へ正規化したSHA-256が一致する場合だけ再取込できます。
 
-マスタから消えた現役地域は物理削除せず、今回の`verified_at`を`valid_to`として終了します。消えた現役関係も同様に履歴を残し、新しい関係は`valid_from`付きで追加します。一度終了した地点が復活した場合は、地点の`active_from`と`located_in`の新しい期間を開始します。`active_to`を持つ廃止地点は、その`active_to`と同じ日付で現役`located_in`を閉じます。`verification_target`はこの同期の対象外です。
+Phase 1のマスタは`verified_at`時点のスナップショットであり、将来予定の開始日・終了日は扱いません。地域の`valid_from`・`valid_to`と地点の`active_from`・`active_to`は、値を指定する場合はすべて`verified_at`以前である必要があります。これにより、`valid_to IS NULL` / `active_to IS NULL`を現役とするインポーターとSQLの判定を一致させます。
+
+マスタから消えた現役地域は物理削除せず、今回の`verified_at`を`valid_to`として終了します。消えた現役関係も同様に履歴を残し、新しい関係は`valid_from`付きで追加します。一度終了した地点が復活する場合、開始日はマスタの`active_from`、未指定なら`verified_at`とし、地点の`active_from`と新しい`located_in.valid_from`の両方に同じ日を使います。期間は半開区間として扱うため直前の`active_to`と同日の復活は許可しますが、それより前の開始日は拒否します。`active_to`を持つ廃止地点は、その`active_to`と同じ日付で現役`located_in`を閉じます。開始・終了の前後関係が逆転する入力は日付を補正や上書きせず、マスタ取込全体をロールバックして拒否します。`verification_target`はこの同期の対象外です。
 
 ## SQLite schema概要
 
@@ -139,7 +141,7 @@ python -c "import sqlite3; c=sqlite3.connect('data/weather.sqlite3'); print(c.ex
 ## 現在の制約
 
 - Phase 1のため予報・観測データはまだ取得しない。
-- 地域・地点マスタは確認日のスナップショットで、気象庁サイトからの自動更新は行わない。
+- 地域・地点マスタは確認日のスナップショットで、将来予定日と気象庁サイトからの自動更新は扱わない。
 - `located_in` は地理的対応で、公式な検証対象地点リストではない。
 - 観測地点テーブル自体は1行/地点のため、廃止後に同じ地点が復活した場合の地点履歴全体は保持しない。地点―区域関係の期間履歴は保持する。
 - 日別観測値、降水判定、気温誤差、calibrationは未実装。

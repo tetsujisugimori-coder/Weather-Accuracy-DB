@@ -59,3 +59,26 @@
 - `python -m compileall -q weatherdb tests`: 成功。
 - source CLIとwheel内のSQL・JSONを使うリポジトリ外CLIで、`init → import-areas → status`が成功。
 - `PRAGMA integrity_check`: `ok`、`PRAGMA foreign_key_check`: 問題なし。
+
+## 2026-08-28 — PR #2 remaining period-boundary fixes for commit 2737c8c
+
+### 修正内容
+
+- 廃止済み地点が現役として復活する場合、新マスタの`active_from`、未指定なら今回の`verified_at`を開始日候補とし、直前の`active_to`より前ならUPSERT前に`MasterDataError`で拒否するようにした。拒否は取込トランザクション内で行い、全マスタ関連テーブルをロールバックする。
+- 正常な復活では決定した同じ開始日を`observation_stations.active_from`と新しい`located_in.valid_from`に使うようにした。
+- `validate_master()`で、地域の`valid_from`・`valid_to`と地点の`active_from`・`active_to`の非NULL値が`verified_at`以前であることを検証するようにした。未来日付のエラーには対象コード、項目名、指定日、`verified_at`を含める。
+
+### 期間境界の設計判断
+
+- Phase 1マスタは確認日時点のスナップショットとし、将来予定の開始・終了は登録しない。これにより、インポーターと`sql/queries.sql`の`IS NULL`による現役判定を一致させる。
+- 有効期間は半開区間とし、復活開始日と直前の終了日の一致は許可する。開始日が終了日より前になる入力は補正・上書きせずマスタ全体を拒否する。
+
+### 追加テストと検証結果
+
+- 古い開始日の復活拒否と全テーブルの不変、直前終了日と同日・後日の復活成功、地点と`located_in`の開始日一致を追加した。
+- 4種の未来日付拒否、`verified_at`と同日の許可、CLIの終了コード1・非Traceback、拒否後のDB不変、最終整合性検査を追加した。
+- `python -m unittest discover -s tests -v`: 既存29件と追加13件の合計42件、全件成功。
+- `python -m compileall -q weatherdb tests`: 成功。
+- source CLIの`init → import-areas → status`: 地域45件、観測地点11件、foreign keys有効、WALで成功。
+- wheelを隔離した一時ディレクトリでビルド・インストールし、リポジトリ外のconsole scriptで`init → import-areas → status`が成功。
+- `PRAGMA integrity_check`: `ok`、`PRAGMA foreign_key_check`: 空。

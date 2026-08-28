@@ -85,6 +85,14 @@ class MasterUpdateTests(unittest.TestCase):
             for table in tables
         }
 
+    def retire_station(self, station_code: str = "46106") -> None:
+        retired = copy.deepcopy(load_master())
+        retired["verified_at"] = "2026-08-29"
+        station = self.station(retired, station_code)
+        station.pop("active_from", None)
+        station["active_to"] = "2026-08-28"
+        import_kanagawa_master(self.connection, self.write_master(retired))
+
     def test_older_master_is_rejected_without_any_master_state_change(self) -> None:
         newer = copy.deepcopy(load_master())
         newer["verified_at"] = "2026-08-29"
@@ -436,8 +444,12 @@ class MasterUpdateTests(unittest.TestCase):
             (station_id,),
         ).fetchone()[0]
         self.assertIsNone(verification_target)
-        self.assertEqual(self.connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-        self.assertEqual(self.connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(
+            self.connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+        )
+        self.assertEqual(
+            self.connection.execute("PRAGMA foreign_key_check").fetchall(), []
+        )
 
     def test_invalid_membership_end_rolls_back_retired_station(self) -> None:
         with self.connection:
@@ -459,6 +471,101 @@ class MasterUpdateTests(unittest.TestCase):
             import_kanagawa_master(self.connection, self.write_master(retired))
         self.assertEqual(self.database_snapshot(), before)
 
+    def test_revival_before_previous_end_is_rejected_with_period_details(self) -> None:
+        self.retire_station()
+        revived = copy.deepcopy(load_master())
+        revived["verified_at"] = "2026-08-30"
+        self.station(revived, "46106")["active_from"] = "2020-01-01"
+
+        with self.assertRaises(MasterDataError) as raised:
+            import_kanagawa_master(self.connection, self.write_master(revived))
+
+        message = str(raised.exception)
+        self.assertIn("46106", message)
+        self.assertIn("2020-01-01", message)
+        self.assertIn("2026-08-28", message)
+
+    def test_rejected_revival_rolls_back_all_master_tables(self) -> None:
+        self.retire_station()
+        before = self.database_snapshot()
+        revived = copy.deepcopy(load_master())
+        revived["verified_at"] = "2026-08-30"
+        revived["areas"][0]["name"] = "更新されない地域名"
+        station = self.station(revived, "46106")
+        station["name"] = "更新されない地点名"
+        station["active_from"] = "2020-01-01"
+
+        with self.assertRaises(MasterDataError):
+            import_kanagawa_master(self.connection, self.write_master(revived))
+
+        self.assertEqual(self.database_snapshot(), before)
+
+    def test_revival_can_start_on_previous_active_to(self) -> None:
+        self.retire_station()
+        revived = copy.deepcopy(load_master())
+        revived["verified_at"] = "2026-08-30"
+        self.station(revived, "46106")["active_from"] = "2026-08-28"
+
+        import_kanagawa_master(self.connection, self.write_master(revived))
+
+        period = self.connection.execute(
+            """
+            SELECT active_from, active_to
+            FROM observation_stations WHERE station_code = '46106'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(period), ("2026-08-28", None))
+
+    def test_revival_can_start_after_previous_active_to(self) -> None:
+        self.retire_station()
+        revived = copy.deepcopy(load_master())
+        revived["verified_at"] = "2026-08-30"
+        self.station(revived, "46106")["active_from"] = "2026-08-29"
+
+        import_kanagawa_master(self.connection, self.write_master(revived))
+
+        period = self.connection.execute(
+            """
+            SELECT active_from, active_to
+            FROM observation_stations WHERE station_code = '46106'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(period), ("2026-08-29", None))
+
+    def test_revival_station_and_membership_use_same_start(self) -> None:
+        self.retire_station()
+        revived = copy.deepcopy(load_master())
+        revived["verified_at"] = "2026-08-30"
+        self.station(revived, "46106").pop("active_from", None)
+
+        import_kanagawa_master(self.connection, self.write_master(revived))
+
+        station_start = self.connection.execute(
+            "SELECT active_from FROM observation_stations WHERE station_code = '46106'"
+        ).fetchone()[0]
+        membership_start = self.connection.execute(
+            """
+            SELECT membership.valid_from
+            FROM station_area_memberships AS membership
+            JOIN observation_stations AS station ON station.id = membership.station_id
+            WHERE station.station_code = '46106'
+              AND membership.relation_type = 'located_in'
+              AND membership.valid_to IS NULL
+            """
+        ).fetchone()[0]
+        self.assertEqual(station_start, "2026-08-30")
+        self.assertEqual(membership_start, station_start)
+
+    def test_integrity_after_revival_period_boundary_update(self) -> None:
+        self.retire_station()
+        revived = copy.deepcopy(load_master())
+        revived["verified_at"] = "2026-08-30"
+        self.station(revived, "46106")["active_from"] = "2026-08-28"
+        import_kanagawa_master(self.connection, self.write_master(revived))
+
+        self.assertEqual(self.connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        self.assertEqual(self.connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
 
 class MasterValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -471,6 +578,26 @@ class MasterValidationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
+
+    def assert_future_date_error(
+        self,
+        collection: str,
+        key: str,
+        code_key: str,
+    ) -> None:
+        invalid = copy.deepcopy(load_master())
+        record = invalid[collection][0]
+        record[key] = "2026-08-28"
+        code = record[code_key]
+
+        with self.assertRaises(MasterDataError) as raised:
+            validate_master(invalid)
+
+        message = str(raised.exception)
+        self.assertIn(code, message)
+        self.assertIn(key, message)
+        self.assertIn("2026-08-28", message)
+        self.assertIn("verified_at=2026-08-27", message)
 
     def test_structural_errors_are_always_master_data_errors(self) -> None:
         base = load_master()
@@ -574,6 +701,94 @@ class MasterValidationTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("エラー:", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_future_area_valid_from_is_rejected(self) -> None:
+        self.assert_future_date_error("areas", "valid_from", "area_code")
+
+    def test_future_area_valid_to_is_rejected(self) -> None:
+        self.assert_future_date_error("areas", "valid_to", "area_code")
+
+    def test_future_station_active_from_is_rejected(self) -> None:
+        self.assert_future_date_error("stations", "active_from", "station_code")
+
+    def test_future_station_active_to_is_rejected(self) -> None:
+        self.assert_future_date_error("stations", "active_to", "station_code")
+
+    def test_dates_equal_to_verified_at_are_accepted(self) -> None:
+        same_day = copy.deepcopy(load_master())
+        same_day["areas"][0]["valid_from"] = same_day["verified_at"]
+        same_day["areas"][1]["valid_to"] = same_day["verified_at"]
+        same_day["stations"][0]["active_from"] = same_day["verified_at"]
+        same_day["stations"][1]["active_to"] = same_day["verified_at"]
+
+        validate_master(same_day)
+
+    def test_cli_future_date_returns_one_without_traceback(self) -> None:
+        initialize(self.db_path)
+        invalid = copy.deepcopy(load_master())
+        invalid["areas"][0]["valid_from"] = "2026-08-28"
+        self.master_path.write_text(
+            json.dumps(invalid, ensure_ascii=False), encoding="utf-8"
+        )
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "import-areas",
+                    "--master",
+                    str(self.master_path),
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("エラー:", stderr.getvalue())
+        self.assertIn("valid_from", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_future_date_rejection_leaves_all_master_tables_unchanged(self) -> None:
+        initialize(self.db_path)
+        connection = connect(self.db_path)
+        try:
+            import_kanagawa_master(connection)
+            tables = (
+                "forecast_areas",
+                "observation_stations",
+                "station_area_memberships",
+                "master_imports",
+            )
+            before = {
+                table: [
+                    tuple(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} ORDER BY id"
+                    ).fetchall()
+                ]
+                for table in tables
+            }
+            invalid = copy.deepcopy(load_master())
+            invalid["stations"][0]["active_to"] = "2026-08-28"
+            self.master_path.write_text(
+                json.dumps(invalid, ensure_ascii=False), encoding="utf-8"
+            )
+
+            with self.assertRaises(MasterDataError):
+                import_kanagawa_master(connection, self.master_path)
+
+            after = {
+                table: [
+                    tuple(row)
+                    for row in connection.execute(
+                        f"SELECT * FROM {table} ORDER BY id"
+                    ).fetchall()
+                ]
+                for table in tables
+            }
+            self.assertEqual(after, before)
+        finally:
+            connection.close()
 
 
 class ForecastPeriodConstraintTests(unittest.TestCase):

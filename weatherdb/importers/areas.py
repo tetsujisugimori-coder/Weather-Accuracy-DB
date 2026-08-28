@@ -68,6 +68,21 @@ def _optional_date_range(record: dict[str, Any], prefix: str, label: str) -> Non
         raise MasterDataError(f"{label} の終了日は開始日より後である必要があります")
 
 
+def _reject_future_date(
+    record: dict[str, Any],
+    key: str,
+    *,
+    subject: str,
+    verified_at: str,
+) -> None:
+    value = record.get(key)
+    if value is not None and value > verified_at:
+        raise MasterDataError(
+            f"{subject} の {key} は verified_at 以前である必要があります: "
+            f"{key}={value} / verified_at={verified_at}"
+        )
+
+
 def _coordinate(value: Any, label: str, minimum: float, maximum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MasterDataError(f"{label} は数値である必要があります")
@@ -96,7 +111,8 @@ def _validate_master(data: Any) -> None:
     if not isinstance(data, dict):
         raise MasterDataError("JSONルートは辞書である必要があります")
 
-    _iso_date(data.get("verified_at"), "verified_at", required=True)
+    verified_at = _iso_date(data.get("verified_at"), "verified_at", required=True)
+    assert verified_at is not None
 
     sources = data.get("sources")
     if not isinstance(sources, dict):
@@ -125,6 +141,13 @@ def _validate_master(data: Any) -> None:
         if parent is not None:
             parent = _non_empty_string(parent, f"{label}.parent_area_code")
         _optional_date_range(area, "valid", label)
+        for key in ("valid_from", "valid_to"):
+            _reject_future_date(
+                area,
+                key,
+                subject=f"地域 {area_code}",
+                verified_at=verified_at,
+            )
         if area_code in area_codes:
             raise MasterDataError(f"地域コードが重複しています: {area_code}")
         area_codes.add(area_code)
@@ -159,6 +182,13 @@ def _validate_master(data: Any) -> None:
         if elevation is not None:
             _finite_number(elevation, f"{label}.elevation")
         _optional_date_range(station, "active", label)
+        for key in ("active_from", "active_to"):
+            _reject_future_date(
+                station,
+                key,
+                subject=f"観測地点 {station_code}",
+                verified_at=verified_at,
+            )
 
         station_areas = station.get("area_codes")
         if not isinstance(station_areas, list):
@@ -319,6 +349,29 @@ def import_kanagawa_master(
             connection.commit()
             return area_count, station_count
 
+        revival_starts: dict[str, str] = {}
+        for station in data["stations"]:
+            if station.get("active_to") is not None:
+                continue
+            station_code = station["station_code"]
+            existing = connection.execute(
+                """
+                SELECT active_to
+                FROM observation_stations
+                WHERE provider_id = ? AND station_code = ?
+                """,
+                (provider_id, station_code),
+            ).fetchone()
+            if existing is None or existing["active_to"] is None:
+                continue
+            revival_start = station.get("active_from") or verified_at
+            if revival_start < existing["active_to"]:
+                raise MasterDataError(
+                    f"観測地点 {station_code} の復活開始日が直前の終了日より前です: "
+                    f"開始日候補 {revival_start} / 直前の終了日 {existing['active_to']}"
+                )
+            revival_starts[station_code] = revival_start
+
         current_area_codes = {area["area_code"] for area in data["areas"]}
         for area in _ordered_areas(data["areas"]):
             parent_id = None
@@ -408,8 +461,8 @@ def import_kanagawa_master(
                 )
             elif is_retired:
                 active_from = station.get("active_from") or existing["active_from"]
-            elif existing["active_to"] is not None:
-                active_from = station.get("active_from") or verified_at
+            elif station_code in revival_starts:
+                active_from = revival_starts[station_code]
             else:
                 active_from = (
                     existing["active_from"]
@@ -471,10 +524,8 @@ def import_kanagawa_master(
                 desired_memberships.update(
                     (station_code, area_code) for area_code in station["area_codes"]
                 )
-                membership_starts[station_code] = (
-                    active_from
-                    if existing is not None and existing["active_to"] is not None
-                    else verified_at
+                membership_starts[station_code] = revival_starts.get(
+                    station_code, verified_at
                 )
 
         active_stations = connection.execute(
