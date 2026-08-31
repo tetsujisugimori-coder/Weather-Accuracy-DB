@@ -8,6 +8,47 @@ from pathlib import Path
 from typing import Any
 
 
+class SchemaCompatibilityError(RuntimeError):
+    """Raised when an existing database predates the Phase 2 schema."""
+
+
+_PHASE2_FORECAST_COLUMNS = {"forecast_area_id", "station_id"}
+_PHASE2_RUN_COLUMNS = {"document_type", "raw_file_sha256", "document_sha256"}
+
+
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def require_phase2_schema(connection: sqlite3.Connection) -> None:
+    """Reject an old Phase 1 DB without changing or deleting it."""
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "forecasts" not in tables or "forecast_runs" not in tables:
+        raise SchemaCompatibilityError("DBが未初期化です。先に init を実行してください")
+    if not _PHASE2_FORECAST_COLUMNS <= _table_columns(connection, "forecasts") or not (
+        _PHASE2_RUN_COLUMNS <= _table_columns(connection, "forecast_runs")
+    ):
+        raise SchemaCompatibilityError(
+            "旧Phase 1スキーマです。DBを削除せずバックアップへ移動し、"
+            "init と import-areas でPhase 2 DBを新規作成してください"
+        )
+
+
+def require_phase2_database(path: Path) -> None:
+    """Inspect an existing DB read-only before opening the normal WAL connection."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        require_phase2_schema(connection)
+    finally:
+        connection.close()
 def connect(path: Path) -> sqlite3.Connection:
     """Open SQLite with the safety settings required by this project."""
     connection = sqlite3.connect(path)
@@ -22,6 +63,7 @@ def initialize(path: Path) -> None:
     """Create the database idempotently and register the JMA provider."""
     path.parent.mkdir(parents=True, exist_ok=True)
     schema = files("weatherdb.resources").joinpath("schema.sql").read_text(encoding="utf-8")
+    require_phase2_database(path)
     connection = connect(path)
     try:
         connection.executescript(schema)
