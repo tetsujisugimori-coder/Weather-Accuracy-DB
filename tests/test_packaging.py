@@ -25,6 +25,7 @@ class WheelPackagingTests(unittest.TestCase):
                 source,
                 ignore=shutil.ignore_patterns(
                     ".git",
+                    ".venv",
                     "data",
                     "__pycache__",
                     "*.pyc",
@@ -69,6 +70,10 @@ class WheelPackagingTests(unittest.TestCase):
             )
             wheels = list(distribution.glob("*.whl"))
             self.assertEqual(len(wheels), 1)
+            self.assertEqual(
+                wheels[0].name,
+                "weather_accuracy_db-0.2.0-py3-none-any.whl",
+            )
             with zipfile.ZipFile(wheels[0]) as wheel:
                 members = set(wheel.namelist())
             self.assertIn("weatherdb/resources/schema.sql", members)

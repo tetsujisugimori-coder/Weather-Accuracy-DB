@@ -82,3 +82,115 @@
 - source CLIの`init → import-areas → status`: 地域45件、観測地点11件、foreign keys有効、WALで成功。
 - wheelを隔離した一時ディレクトリでビルド・インストールし、リポジトリ外のconsole scriptで`init → import-areas → status`が成功。
 - `PRAGMA integrity_check`: `ok`、`PRAGMA foreign_key_check`: 空。
+## 2026-09-01 — Phase 2 forecast ingestion
+
+### 作業開始時の状態
+
+- `main`、`f186a1f`、`origin/main`と一致し、追跡対象の未コミット変更なし。
+- 開始時の既存テストは、実装テスト41件が成功。wheelテスト1件だけはシステムPython 3.14に`pip`がないため失敗した。`python -m compileall -q weatherdb tests`は成功した。
+- Phase 1の地域・地点マスタ、履歴同期、既存テストを維持した。
+
+### 実装内容と設計
+
+- 気象庁の神奈川県府県天気予報JSONを`urllib.request`で取得する`fetch-forecast`を追加した。既定URL、timeout、User-Agentを一か所で管理し、timeout、HTTP status、接続、空レスポンスを通常エラーとして扱う。
+- JSON decode、短期・週間識別、時刻変換、要素変換、HTTP取得、raw保存、DB保存を分離した。短期・週間は配列位置ではなくtimeSeriesの要素構造で識別する。
+- `forecast_runs`へ`document_type`、`raw_file_sha256`、`document_sha256`を追加した。HTTPレスポンス全体のraw hashと、キー順を正規化した文書単位hashを分離した。Phase 1互換用`content_sha256`は残したがPhase 2処理では使用しない。
+- `forecasts.forecast_area_id`をnullableにし、nullableな`station_id`外部キーを追加した。CHECKで区域・地点のどちらか一方だけを必須とし、区域・地点別の部分UNIQUE INDEXで自然キー重複を防ぐ。
+- 区域天気・降水確率は`forecast_area_id`、短期・週間気温は元JSONの地点コードを`station_id`へ保存する。地点気温を東部・西部へ推測変換しない。
+- DB時刻はUTC `+00:00`、日付境界と期間解釈は日本時間。日別天気・気温は日本時間の1日、短期降水確率はtimeDefineから6時間、週間降水確率は日別とした。
+- 短期気温は日本時間00:00を最低、09:00を最高としてtimestampから分類し、配列位置を使わない。5時・11時・17時相当fixtureで個数・並びの変化を検証した。安全に解釈できない時刻は構造エラーとする。
+- rawレスポンス元bytesを`raw/jma/forecasts/`へ一時ファイル、flush、`fsync`、置換の順で保存する。名前はUTC取得時刻、地域コード、種別、hash断片、nonceを含む。DBには絶対パスとSHA-256だけを保存する。
+- 文書識別後に`started` runを作り、全forecast INSERTと`completed`更新を同じtransactionで行う。失敗時はforecastを全rollbackし、別transactionで`failed`と500文字以下の原因を保存する。文書識別前の失敗は発表日時・種別NULLのfailed runにする。
+- 同一`document_sha256`はskipし、同一対象日でも発表日時または内容が異なる文書は別runとして履歴追加する。
+- 旧Phase 1スキーマは読み取り専用接続で検出し、自動変更・削除せず、バックアップ後の新規作成を案内する方針を採用した。
+- `status`へ最後のrunの短いエラー表示を追加した。Phase 3の観測取得、対応付け、降水・気温分析、calibration、Web UIには進んでいない。
+
+### 公式データ確認
+
+- 2026-09-01（日本時間）に`https://www.jma.go.jp/bosai/forecast/data/forecast/140000.json`と`https://www.jma.go.jp/bosai/common/const/area.json`を確認した。
+- HTTPレスポンス内で短期文書は2026-09-01 05:00 JST、週間文書は2026-08-31 17:00 JSTと異なる`reportDatetime`だった。
+- 短期は東部・西部の天気と6時間降水確率、横浜・小田原の気温、週間は神奈川県の天気・降水確率、横浜の最高・最低気温を確認した。
+- 表示用JSONはバージョン固定APIではないため、確認構造と注意点を`docs/data-sources.md`へ記録し、fixtureとraw保存を採用した。
+
+### 追加テスト
+
+- 短期・週間正常parse、文書順入替、5時・11時・17時の気温時刻規則。
+- 区域・地点の保存先、UTC変換、日別期間、6時間期間、未知コード、必須キー、配列長、不正日時、範囲外確率、decodeエラー。
+- XOR CHECK、区域・地点別重複防止、同一文書skip、異なる発表回の履歴、issued/fetched分離。
+- timeout、HTTP status、空レスポンス、raw保存失敗、parser失敗、DB途中失敗rollback、部分forecast非残存。
+- CLI成功/失敗コード、非Traceback、DB・マスタ不足、statusエラー、旧Phase 1 DB非変更案内。
+- 18件を追加し、既存42件と合わせて60件。
+
+### 実行コマンドと結果
+
+- `python -m unittest discover -s tests -v`: システムPythonでは59件成功、wheelテスト1件のみ`No module named pip`で失敗（開始時と同じ環境要因）。
+- `python -m venv --system-site-packages .venv`: リポジトリ内のgitignore対象検証環境を作成。
+- `.venv\\Scripts\\python.exe -m unittest discover -s tests -q`: 60件、全件成功。
+- `.venv\\Scripts\\python.exe -m compileall -q weatherdb tests`: 成功。
+- wheel単独テスト: wheel build、offline install、リポジトリ外console scriptの`init → import-areas → status`が成功。
+- `python -m weatherdb --db .\\data\\phase2-test.sqlite3 init`: 成功。
+- `python -m weatherdb --db .\\data\\phase2-test.sqlite3 import-areas`: 地域45件、観測地点11件、成功。
+- `python -m weatherdb --db .\\data\\phase2-test.sqlite3 fetch-forecast`: 実ネットワークで成功。短期・週間2文書、completed 2 run、43 forecastを保存。
+- 同じ`fetch-forecast`を再実行: completed 0、forecast 0、2文書skip。DB件数は2 run、43 forecastのまま。
+- `python -m weatherdb --db .\\data\\phase2-test.sqlite3 status`: run 2、forecast 43、最後のstatus completed。
+- 履歴SQL: `short_term`と`weekly`を別run・別`issued_at`で確認。区域天気11件、区域降水確率21件、地点気温11件。同じtarget_startへ異なる2発表日時が共存した。
+- `PRAGMA integrity_check`: `ok`。
+- `PRAGMA foreign_key_check`: 0件（問題なし）。
+
+### 現在の制約
+
+- 気象庁表示用JSONの構造変更時はparserとfixture更新が必要。
+- システムPythonには`pip`がないため、wheel検証は標準venv内で実施した。実行時機能にはpipも外部依存も不要。
+- 観測値取得、予報と実測の対応付け、降水分析、気温誤差、calibration、Web UIはPhase 3以降。
+
+## 2026-09-01 — PR #4 retry・raw整理・INDEX修正
+
+### 原因と修正内容
+
+- `forecast_runs.document_sha256`のUNIQUE INDEXと重複検索がstatusを区別していなかったため、`failed`または異常終了後の`started`が同じ文書の再試行を永久に阻害していた。
+- 文書hashのUNIQUE INDEXを`status = 'completed'`だけに適用する部分UNIQUE INDEXへ変更し、重複判定もcompletedだけを対象にした。failed・startedは監査履歴として残したまま、別runで再試行する。
+- forecast INSERTとcompleted更新は引き続き同じtransactionで行う。completed更新時にも既存completedを確認し、同時実行で別runが先にcompletedになった場合は競合側をrollbackしてskipする。部分forecastと同一文書の複数completedを残さない。
+- raw保存後に全文書がcompleted済みと判定された場合、DBから参照されない今回のrawだけを削除し、`FetchSummary.raw_file_path`をNULLにする。短期・週間の一方が新規・再試行・failedなら共通rawは保持する。
+- raw削除に失敗した場合は無言で継続せず、残ったrawを参照するfailed runを監査記録として作成して通常エラーを返す。ファイルが既に存在しない場合は、存在しないパスを記録しない。
+- `status`の表示名を「最新保存run取得日時」へ変更し、HTTP試行時刻ではなく最新の保存済みrunの`fetched_at`であることをREADMEへ明記した。
+- `forecasts(forecast_run_id)`の通常INDEX `idx_forecasts_run`を追加した。区域・地点別の部分UNIQUE INDEXは維持した。
+- READMEのwheel例を`weather_accuracy_db-0.2.0-py3-none-any.whl`へ修正した。
+
+### スキーマ互換性の判断
+
+- 旧Phase 1 DBを自動変更しない方針は維持した。
+- PR #4初期版のPhase 2 DBはテーブル変更を伴わないINDEX修正だけで安全に更新できるため、`init`再実行で旧文書INDEXをdrop/recreateし、run INDEXを追加できるようにした。通常の取得処理は必要なINDEXがない場合に`init`再実行を案内する。
+
+### 追加・変更テスト
+
+- parser失敗後の同一JSON再試行、failed履歴保持、成功後の重複skip。
+- 残存started runが同一JSONの再試行を阻害しないこと。
+- completed競合で片側をrollbackし、completedが1件だけになること。
+- 全文書重複時の未参照raw削除、CLIの削除済みパス非表示。
+- 短期重複・週間新規の混在時に共通rawを保持すること。
+- parser失敗時にfailed runからrawを参照できること。
+- raw削除失敗のエラー通知と監査run。
+- `PRAGMA index_list/index_info`と`EXPLAIN QUERY PLAN`によるrun INDEX確認、初期Phase 2 INDEXの`init`更新。
+- wheelファイル名がバージョン`0.2.0`と一致すること。`.venv`をpackagingテストのリポジトリコピー対象から除外した。
+- 既存60件に8件を追加し、合計68件。
+
+### 実行コマンドと結果
+
+- `python -m unittest discover -s tests -v`: 実装テスト67件は成功。システムPython 3.14にpipがないためwheelテスト1件だけ`No module named pip`で失敗した。
+- `.venv\\Scripts\\python.exe -m unittest discover -s tests -v`: 68件、全件成功。wheel build、隔離install、リポジトリ外CLIも成功。
+- `python -m compileall -q weatherdb tests`: 成功。
+- `python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist`: システムPythonにpipがないため未実行相当の失敗。
+- `.venv\\Scripts\\python.exe -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist`: 成功。生成物は`weather_accuracy_db-0.2.0-py3-none-any.whl`。
+- 新規`data/phase2-retry-test.sqlite3`の`init → import-areas → fetch-forecast → status`: 成功。地域45件、地点11件、completed 2 run、forecast 39件。
+- 同じJSONの2回目取得: completed 0、forecast 0、skip 2。runとforecast件数は増えず、rawファイル数も増えなかった。CLIは削除済みrawパスを表示しなかった。
+- `PRAGMA integrity_check`: `ok`。
+- `PRAGMA foreign_key_check`: 0件。
+- completed文書の重複group: 0件。
+- `EXPLAIN QUERY PLAN SELECT * FROM forecasts WHERE forecast_run_id = ?`: `idx_forecasts_run`の利用を確認。
+
+### 残っている制約
+
+- 気象庁表示用JSONの構造変更時はparserとfixture更新が必要。
+- システムPythonにはpipがないため、wheelを含む完全な検証は既存venvで実施した。実行時の外部Python依存は追加していない。
+- HTTP取得試行自体は履歴化せず、保存された文書runだけを履歴化する。全文書重複時の取得時刻はstatusへ反映しない。
+- 観測値取得、精度分析、calibration、Web UIはPhase 3以降。

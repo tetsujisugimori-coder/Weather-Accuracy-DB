@@ -67,3 +67,34 @@ SELECT observed_at, precipitation_mm, temperature_c
 FROM observations
 WHERE station_id = 1
 ORDER BY observed_at;
+-- Phase 2: run history with separate issue/fetch times and document kinds.
+SELECT id, document_type, issued_at, fetched_at, status,
+       raw_file_path, raw_file_sha256, document_sha256
+FROM forecast_runs
+ORDER BY issued_at DESC, id DESC;
+
+-- Phase 2: preserve the original area/station target distinction.
+SELECT
+    run.document_type,
+    run.issued_at,
+    forecast.target_start,
+    forecast.target_end,
+    forecast.forecast_type,
+    area.area_code,
+    station.station_code,
+    forecast.weather_code,
+    forecast.precipitation_probability,
+    forecast.high_temperature,
+    forecast.low_temperature
+FROM forecasts AS forecast
+JOIN forecast_runs AS run ON run.id = forecast.forecast_run_id
+LEFT JOIN forecast_areas AS area ON area.id = forecast.forecast_area_id
+LEFT JOIN observation_stations AS station ON station.id = forecast.station_id
+ORDER BY forecast.target_start, run.issued_at, forecast.id;
+
+-- idx_forecasts_run must support a run-only lookup; the area/station natural
+-- key indexes are partial and cannot satisfy this predicate by themselves.
+EXPLAIN QUERY PLAN
+SELECT *
+FROM forecasts
+WHERE forecast_run_id = 1;

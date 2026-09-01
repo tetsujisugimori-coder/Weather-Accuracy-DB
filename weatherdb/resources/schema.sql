@@ -64,19 +64,29 @@ CREATE TABLE IF NOT EXISTS forecast_runs (
     provider_id INTEGER NOT NULL REFERENCES providers(id),
     fetched_at TEXT NOT NULL,
     issued_at TEXT,
+    document_type TEXT CHECK (document_type IN ('short_term', 'weekly')),
     source_url TEXT NOT NULL,
     raw_file_path TEXT,
+    raw_file_sha256 TEXT,
+    document_sha256 TEXT,
+    -- Phase 1 compatibility only. Phase 2 ingestion uses the two explicit hashes above.
     content_sha256 TEXT,
     status TEXT NOT NULL CHECK (status IN ('started', 'completed', 'failed')),
     error_message TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (provider_id, content_sha256)
+    UNIQUE (provider_id, content_sha256),
+    CHECK (
+        status = 'failed'
+        OR (issued_at IS NOT NULL AND document_type IS NOT NULL AND document_sha256 IS NOT NULL)
+        OR content_sha256 IS NOT NULL
+    )
 );
 
 CREATE TABLE IF NOT EXISTS forecasts (
     id INTEGER PRIMARY KEY,
     forecast_run_id INTEGER NOT NULL REFERENCES forecast_runs(id) ON DELETE CASCADE,
-    forecast_area_id INTEGER NOT NULL REFERENCES forecast_areas(id),
+    forecast_area_id INTEGER REFERENCES forecast_areas(id),
+    station_id INTEGER REFERENCES observation_stations(id),
     target_start TEXT NOT NULL,
     target_end TEXT NOT NULL,
     forecast_type TEXT NOT NULL,
@@ -86,8 +96,11 @@ CREATE TABLE IF NOT EXISTS forecasts (
     high_temperature REAL,
     low_temperature REAL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (forecast_run_id, forecast_area_id, target_start, target_end, forecast_type),
-    CHECK (target_end > target_start)
+    CHECK (target_end > target_start),
+    CHECK (
+        (forecast_area_id IS NOT NULL AND station_id IS NULL)
+        OR (forecast_area_id IS NULL AND station_id IS NOT NULL)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -117,6 +130,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_station_memberships_active
     WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_issued_at ON forecast_runs(issued_at);
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_fetched_at ON forecast_runs(fetched_at);
+-- Retain failed/started attempts for audit and allow a later retry. Only a
+-- successfully completed copy of a provider document is globally unique.
+DROP INDEX IF EXISTS idx_forecast_runs_document;
+CREATE UNIQUE INDEX idx_forecast_runs_document
+    ON forecast_runs(provider_id, document_sha256)
+    WHERE document_sha256 IS NOT NULL AND status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_forecasts_target_start ON forecasts(target_start);
 CREATE INDEX IF NOT EXISTS idx_forecasts_area ON forecasts(forecast_area_id);
+CREATE INDEX IF NOT EXISTS idx_forecasts_station ON forecasts(station_id);
+CREATE INDEX IF NOT EXISTS idx_forecasts_run ON forecasts(forecast_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_forecasts_area_natural_key
+    ON forecasts(forecast_run_id, forecast_area_id, target_start, target_end, forecast_type)
+    WHERE forecast_area_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_forecasts_station_natural_key
+    ON forecasts(forecast_run_id, station_id, target_start, target_end, forecast_type)
+    WHERE station_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_observations_observed_at ON observations(observed_at);
