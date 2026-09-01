@@ -33,7 +33,7 @@ class ForecastFetchError(RuntimeError):
 
 @dataclass(frozen=True)
 class FetchSummary:
-    raw_file_path: Path
+    raw_file_path: Path | None
     document_count: int
     completed_runs: int
     forecast_count: int
@@ -98,6 +98,23 @@ def _message(exc: BaseException) -> str:
     return value[:MAX_ERROR_LENGTH]
 
 
+class _CompletedElsewhere(RuntimeError):
+    """Internal signal for a concurrent completed-document winner."""
+
+
+def _completed_document_exists(
+    connection: sqlite3.Connection, provider_id: int, document_sha256: str
+) -> bool:
+    return connection.execute(
+        """
+        SELECT 1 FROM forecast_runs
+        WHERE provider_id = ? AND document_sha256 = ? AND status = 'completed'
+        LIMIT 1
+        """,
+        (provider_id, document_sha256),
+    ).fetchone() is not None
+
+
 def _create_failed_run(
     connection: sqlite3.Connection,
     provider_id: int,
@@ -131,11 +148,7 @@ def _save_document(
     known_areas: set[str],
     known_stations: set[str],
 ) -> tuple[bool, int]:
-    duplicate = connection.execute(
-        "SELECT id FROM forecast_runs WHERE provider_id = ? AND document_sha256 = ?",
-        (provider_id, document.sha256),
-    ).fetchone()
-    if duplicate:
+    if _completed_document_exists(connection, provider_id, document.sha256):
         return False, 0
     with connection:
         run_id = connection.execute(
@@ -150,42 +163,68 @@ def _save_document(
         ).lastrowid
     try:
         records = parse_document(document, known_areas, known_stations)
-        with connection:
-            for record in records:
-                area_id = None
-                station_id = None
-                if record.target_kind == "area":
-                    row = connection.execute(
-                        "SELECT id FROM forecast_areas WHERE provider_id=? AND area_code=?",
-                        (provider_id, record.target_code),
-                    ).fetchone()
-                    area_id = row[0] if row else None
-                else:
-                    row = connection.execute(
-                        "SELECT id FROM observation_stations WHERE provider_id=? AND station_code=?",
-                        (provider_id, record.target_code),
-                    ).fetchone()
-                    station_id = row[0] if row else None
-                if area_id is None and station_id is None:
-                    raise ForecastDataError(f"対象コードをDBで解決できません: {record.target_code}")
-                connection.execute(
+        try:
+            with connection:
+                for record in records:
+                    area_id = None
+                    station_id = None
+                    if record.target_kind == "area":
+                        row = connection.execute(
+                            "SELECT id FROM forecast_areas WHERE provider_id=? AND area_code=?",
+                            (provider_id, record.target_code),
+                        ).fetchone()
+                        area_id = row[0] if row else None
+                    else:
+                        row = connection.execute(
+                            "SELECT id FROM observation_stations WHERE provider_id=? AND station_code=?",
+                            (provider_id, record.target_code),
+                        ).fetchone()
+                        station_id = row[0] if row else None
+                    if area_id is None and station_id is None:
+                        raise ForecastDataError(
+                            f"対象コードをDBで解決できません: {record.target_code}"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO forecasts
+                          (forecast_run_id, forecast_area_id, station_id, target_start,
+                           target_end, forecast_type, weather_code, weather_text,
+                           precipitation_probability, high_temperature, low_temperature)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (run_id, area_id, station_id, record.target_start, record.target_end,
+                         record.forecast_type, record.weather_code, record.weather_text,
+                         record.precipitation_probability, record.high_temperature,
+                         record.low_temperature),
+                    )
+                updated = connection.execute(
                     """
-                    INSERT INTO forecasts
-                      (forecast_run_id, forecast_area_id, station_id, target_start,
-                       target_end, forecast_type, weather_code, weather_text,
-                       precipitation_probability, high_temperature, low_temperature)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    UPDATE forecast_runs
+                    SET status='completed', error_message=NULL
+                    WHERE id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM forecast_runs
+                          WHERE provider_id = ?
+                            AND document_sha256 = ?
+                            AND status = 'completed'
+                            AND id <> ?
+                      )
                     """,
-                    (run_id, area_id, station_id, record.target_start, record.target_end,
-                     record.forecast_type, record.weather_code, record.weather_text,
-                     record.precipitation_probability, record.high_temperature,
-                     record.low_temperature),
+                    (run_id, provider_id, document.sha256, run_id),
                 )
-            connection.execute(
-                "UPDATE forecast_runs SET status='completed', error_message=NULL WHERE id=?",
-                (run_id,),
-            )
+                if updated.rowcount != 1:
+                    raise _CompletedElsewhere()
+        except sqlite3.IntegrityError:
+            if _completed_document_exists(connection, provider_id, document.sha256):
+                with connection:
+                    connection.execute("DELETE FROM forecast_runs WHERE id=?", (run_id,))
+                return False, 0
+            raise
         return True, len(records)
+    except _CompletedElsewhere:
+        with connection:
+            connection.execute("DELETE FROM forecast_runs WHERE id=?", (run_id,))
+        return False, 0
     except (ForecastDataError, sqlite3.Error, OSError) as exc:
         if connection.in_transaction:
             connection.rollback()
@@ -195,6 +234,43 @@ def _save_document(
                 (_message(exc), run_id),
             )
         raise
+
+
+def _keep_or_discard_raw(
+    connection: sqlite3.Connection,
+    provider_id: int,
+    fetched_at: str,
+    source_url: str,
+    raw_file_path: Path,
+    raw_sha256: str,
+) -> Path | None:
+    """Delete an unreferenced all-duplicate raw, or retain and report cleanup failure."""
+    referenced = connection.execute(
+        "SELECT 1 FROM forecast_runs WHERE raw_file_path=? LIMIT 1",
+        (str(raw_file_path),),
+    ).fetchone()
+    if referenced:
+        return raw_file_path
+    try:
+        raw_file_path.unlink()
+    except OSError as exc:
+        cleanup_error = ForecastFetchError(
+            f"重複取得の未参照raw JSONを削除できません: {exc}"
+        )
+        # If the file still exists, retain it as evidence referenced by a failed
+        # run. If it disappeared concurrently, do not write a dead path.
+        retained_path = raw_file_path if raw_file_path.exists() else None
+        _create_failed_run(
+            connection,
+            provider_id,
+            fetched_at,
+            source_url,
+            cleanup_error,
+            retained_path,
+            raw_sha256 if retained_path else None,
+        )
+        raise cleanup_error from exc
+    return None
 
 
 def fetch_and_store_forecast(
@@ -264,4 +340,7 @@ def fetch_and_store_forecast(
             forecasts += record_count
         else:
             skipped += 1
-    return FetchSummary(raw_file, len(documents), completed, forecasts, skipped)
+    retained_raw = _keep_or_discard_raw(
+        connection, provider_id, fetched_at, url, raw_file, raw_sha256
+    )
+    return FetchSummary(retained_raw, len(documents), completed, forecasts, skipped)

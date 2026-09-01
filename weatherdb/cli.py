@@ -79,7 +79,7 @@ def _print_status(status: dict[str, object]) -> None:
         ("forecast件数", "forecasts"),
         ("observation件数", "observations"),
         ("最新予報発表日時", "latest_issued_at"),
-        ("最新予報取得日時", "latest_fetched_at"),
+        ("最新保存run取得日時", "latest_fetched_at"),
         ("最新観測日時", "latest_observed_at"),
         ("最後の取得status", "last_run_status"),
         ("最後の取得エラー", "last_run_error"),
@@ -122,7 +122,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
             finally:
                 connection.close()
-            print(f"raw保存先: {summary.raw_file_path}")
+            raw_display = (
+                str(summary.raw_file_path)
+                if summary.raw_file_path is not None
+                else "-（全文書がcompleted済みのため新規rawを削除）"
+            )
+            print(f"raw保存先: {raw_display}")
             print(f"処理した予報文書数: {summary.document_count}")
             print(f"completed run数: {summary.completed_runs}")
             print(f"保存したforecast件数: {summary.forecast_count}")

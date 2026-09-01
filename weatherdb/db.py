@@ -14,13 +14,15 @@ class SchemaCompatibilityError(RuntimeError):
 
 _PHASE2_FORECAST_COLUMNS = {"forecast_area_id", "station_id"}
 _PHASE2_RUN_COLUMNS = {"document_type", "raw_file_sha256", "document_sha256"}
+_RETRY_INDEX_NAME = "idx_forecast_runs_document"
+_FORECAST_RUN_INDEX_NAME = "idx_forecasts_run"
 
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
-def require_phase2_schema(connection: sqlite3.Connection) -> None:
+def _require_phase2_columns(connection: sqlite3.Connection) -> None:
     """Reject an old Phase 1 DB without changing or deleting it."""
     tables = {
         row[0]
@@ -39,6 +41,25 @@ def require_phase2_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def require_phase2_schema(connection: sqlite3.Connection) -> None:
+    """Require the current Phase 2 columns and retry/index definitions."""
+    _require_phase2_columns(connection)
+    retry_index = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (_RETRY_INDEX_NAME,),
+    ).fetchone()
+    forecast_run_index = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        (_FORECAST_RUN_INDEX_NAME,),
+    ).fetchone()
+    normalized_sql = " ".join((retry_index[0] if retry_index else "").lower().split())
+    if "status = 'completed'" not in normalized_sql or not forecast_run_index:
+        raise SchemaCompatibilityError(
+            "Phase 2スキーマ更新が必要です。DBをバックアップしたうえで "
+            "init を再実行してください"
+        )
+
+
 def require_phase2_database(path: Path) -> None:
     """Inspect an existing DB read-only before opening the normal WAL connection."""
     if not path.exists() or path.stat().st_size == 0:
@@ -46,9 +67,13 @@ def require_phase2_database(path: Path) -> None:
     uri = f"{path.resolve().as_uri()}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     try:
-        require_phase2_schema(connection)
+        # initialize() may safely replace only Phase 2 indexes after this check;
+        # Phase 1 tables are still rejected before a normal writable connection.
+        _require_phase2_columns(connection)
     finally:
         connection.close()
+
+
 def connect(path: Path) -> sqlite3.Connection:
     """Open SQLite with the safety settings required by this project."""
     connection = sqlite3.connect(path)

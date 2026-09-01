@@ -130,12 +130,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_station_memberships_active
     WHERE valid_to IS NULL;
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_issued_at ON forecast_runs(issued_at);
 CREATE INDEX IF NOT EXISTS idx_forecast_runs_fetched_at ON forecast_runs(fetched_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_forecast_runs_document
+-- Retain failed/started attempts for audit and allow a later retry. Only a
+-- successfully completed copy of a provider document is globally unique.
+DROP INDEX IF EXISTS idx_forecast_runs_document;
+CREATE UNIQUE INDEX idx_forecast_runs_document
     ON forecast_runs(provider_id, document_sha256)
-    WHERE document_sha256 IS NOT NULL;
+    WHERE document_sha256 IS NOT NULL AND status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_forecasts_target_start ON forecasts(target_start);
 CREATE INDEX IF NOT EXISTS idx_forecasts_area ON forecasts(forecast_area_id);
 CREATE INDEX IF NOT EXISTS idx_forecasts_station ON forecasts(station_id);
+CREATE INDEX IF NOT EXISTS idx_forecasts_run ON forecasts(forecast_run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_forecasts_area_natural_key
     ON forecasts(forecast_run_id, forecast_area_id, target_start, target_end, forecast_type)
     WHERE forecast_area_id IS NOT NULL;

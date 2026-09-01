@@ -12,7 +12,13 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 from weatherdb.cli import main
-from weatherdb.db import SchemaCompatibilityError, connect, database_status, initialize
+from weatherdb.db import (
+    SchemaCompatibilityError,
+    connect,
+    database_status,
+    initialize,
+    require_phase2_schema,
+)
 from weatherdb.forecast_fetch import (
     ForecastFetchError,
     fetch_and_store_forecast,
@@ -198,6 +204,44 @@ class DatabaseAndFetchTests(Phase2Base):
         with self.assertRaises(sqlite3.IntegrityError):
             self.connection.execute(station_sql, (run_id, None, station_id, "2026-08-29T00:00:00+00:00", "2026-08-30T00:00:00+00:00"))
 
+    def test_run_lookup_has_a_non_partial_index(self) -> None:
+        indexes = {
+            row[1]: row for row in self.connection.execute("PRAGMA index_list(forecasts)")
+        }
+        self.assertIn("idx_forecasts_run", indexes)
+        self.assertEqual(indexes["idx_forecasts_run"][4], 0)
+        columns = [
+            row[2]
+            for row in self.connection.execute("PRAGMA index_info(idx_forecasts_run)")
+        ]
+        self.assertEqual(columns, ["forecast_run_id"])
+        plan = self.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM forecasts WHERE forecast_run_id=?",
+            (1,),
+        ).fetchall()
+        self.assertIn("idx_forecasts_run", " ".join(str(row[3]) for row in plan))
+
+    def test_initial_phase2_indexes_can_be_safely_upgraded_by_init(self) -> None:
+        with self.connection:
+            self.connection.execute("DROP INDEX idx_forecast_runs_document")
+            self.connection.execute(
+                """CREATE UNIQUE INDEX idx_forecast_runs_document
+                   ON forecast_runs(provider_id,document_sha256)
+                   WHERE document_sha256 IS NOT NULL"""
+            )
+            self.connection.execute("DROP INDEX idx_forecasts_run")
+        with self.assertRaisesRegex(SchemaCompatibilityError, "init"):
+            require_phase2_schema(self.connection)
+
+        self.connection.close()
+        initialize(self.db_path)
+        self.connection = connect(self.db_path)
+        require_phase2_schema(self.connection)
+        index_sql = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='idx_forecast_runs_document'"
+        ).fetchone()[0]
+        self.assertIn("status = 'completed'", index_sql)
+
     def test_fetch_saves_raw_runs_forecasts_and_separate_timestamps(self) -> None:
         raw = documents("forecast_short_0500.json", "forecast_weekly.json")
         result = self.run_fetch(raw)
@@ -218,12 +262,16 @@ class DatabaseAndFetchTests(Phase2Base):
 
     def test_duplicate_document_skips_but_new_issue_preserves_history(self) -> None:
         first = self.run_fetch(fixture("forecast_short_0500.json"))
+        raw_count = len(list(self.raw_dir.glob("*.json")))
         duplicate = self.run_fetch(fixture("forecast_short_0500.json"), "2026-08-29T04:00:00+00:00")
+        duplicate_raw_count = len(list(self.raw_dir.glob("*.json")))
         before = self.connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
         changed = self.run_fetch(fixture("forecast_short_1100.json"), "2026-08-29T05:00:00+00:00")
         after = self.connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
         self.assertGreater(first.forecast_count, 0)
         self.assertEqual((duplicate.completed_runs, duplicate.skipped_documents, duplicate.forecast_count), (0, 1, 0))
+        self.assertIsNone(duplicate.raw_file_path)
+        self.assertEqual(duplicate_raw_count, raw_count)
         self.assertEqual(changed.completed_runs, 1)
         self.assertGreater(after, before)
         same_day = self.connection.execute(
@@ -237,10 +285,233 @@ class DatabaseAndFetchTests(Phase2Base):
         broken[0]["timeSeries"][1]["areas"][0]["pops"][0] = "999"
         with self.assertRaises(ForecastFetchError):
             self.run_fetch(json.dumps(broken).encode())
-        run = self.connection.execute("SELECT status,error_message FROM forecast_runs ORDER BY id DESC").fetchone()
+        run = self.connection.execute(
+            "SELECT status,error_message,raw_file_path FROM forecast_runs ORDER BY id DESC"
+        ).fetchone()
         self.assertEqual(run[0], "failed")
         self.assertIn("0から100", run[1])
+        self.assertTrue(Path(run[2]).is_file())
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0], 0)
+
+    def test_failed_document_retries_then_completed_document_skips(self) -> None:
+        raw = fixture("forecast_short_1700.json")
+        document = identify_documents(decode_forecast_json(raw))[0]
+        with patch(
+            "weatherdb.forecast_fetch.parse_document",
+            side_effect=ForecastDataError("一時的なparser失敗"),
+        ):
+            with self.assertRaises(ForecastFetchError):
+                self.run_fetch(raw)
+
+        retried = self.run_fetch(raw, "2026-08-29T04:00:00+00:00")
+        forecast_count = self.connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
+        skipped = self.run_fetch(raw, "2026-08-29T05:00:00+00:00")
+        runs = self.connection.execute(
+            """
+            SELECT status,error_message FROM forecast_runs
+            WHERE document_sha256=? ORDER BY id
+            """,
+            (document.sha256,),
+        ).fetchall()
+
+        self.assertEqual(retried.completed_runs, 1)
+        self.assertEqual([row[0] for row in runs], ["failed", "completed"])
+        self.assertIn("一時的なparser失敗", runs[0][1])
+        self.assertIsNone(runs[1][1])
+        self.assertEqual(skipped.skipped_documents, 1)
+        self.assertIsNone(skipped.raw_file_path)
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0],
+            forecast_count,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM forecast_runs
+                   WHERE document_sha256=? AND status='completed'""",
+                (document.sha256,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_existing_started_document_does_not_block_retry(self) -> None:
+        raw = fixture("forecast_short_1700.json")
+        document = identify_documents(decode_forecast_json(raw))[0]
+        provider_id = self.connection.execute(
+            "SELECT id FROM providers WHERE code='JMA'"
+        ).fetchone()[0]
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO forecast_runs
+                  (provider_id,fetched_at,issued_at,document_type,source_url,
+                   raw_file_path,raw_file_sha256,document_sha256,status)
+                VALUES (?,?,?,?,?,?,?,?, 'started')
+                """,
+                (
+                    provider_id,
+                    "2026-08-29T02:00:00+00:00",
+                    document.issued_at,
+                    document.document_type,
+                    "https://example.invalid/140000.json",
+                    str(self.root / "interrupted.json"),
+                    "manual-raw-hash",
+                    document.sha256,
+                ),
+            )
+
+        result = self.run_fetch(raw)
+        statuses = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT status FROM forecast_runs WHERE document_sha256=? ORDER BY id",
+                (document.sha256,),
+            )
+        ]
+        self.assertEqual(result.completed_runs, 1)
+        self.assertEqual(statuses, ["started", "completed"])
+
+        duplicate = self.run_fetch(raw, "2026-08-29T04:00:00+00:00")
+        self.assertEqual(duplicate.skipped_documents, 1)
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM forecast_runs
+                   WHERE document_sha256=? AND status='completed'""",
+                (document.sha256,),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_completed_document_unique_index_is_status_scoped(self) -> None:
+        raw = fixture("forecast_short_1700.json")
+        document = identify_documents(decode_forecast_json(raw))[0]
+        self.run_fetch(raw)
+        index_sql = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name='idx_forecast_runs_document'"
+        ).fetchone()[0]
+        self.assertIn("status = 'completed'", index_sql)
+        provider_id = self.connection.execute(
+            "SELECT id FROM providers WHERE code='JMA'"
+        ).fetchone()[0]
+        with self.assertRaises(sqlite3.IntegrityError):
+            with self.connection:
+                self.connection.execute(
+                    """
+                    INSERT INTO forecast_runs
+                      (provider_id,fetched_at,issued_at,document_type,source_url,
+                       document_sha256,status)
+                    VALUES (?,?,?,?,?,?, 'completed')
+                    """,
+                    (
+                        provider_id,
+                        "2026-08-29T06:00:00+00:00",
+                        document.issued_at,
+                        document.document_type,
+                        "https://example.invalid/140000.json",
+                        document.sha256,
+                    ),
+                )
+
+    def test_concurrent_completed_winner_rolls_back_losing_forecasts(self) -> None:
+        raw = fixture("forecast_short_1700.json")
+        document = identify_documents(decode_forecast_json(raw))[0]
+        rival = connect(self.db_path)
+
+        def complete_in_rival_then_parse(*args):
+            provider_id = rival.execute(
+                "SELECT id FROM providers WHERE code='JMA'"
+            ).fetchone()[0]
+            area_id = rival.execute(
+                "SELECT id FROM forecast_areas WHERE area_code='140010'"
+            ).fetchone()[0]
+            with rival:
+                rival_run_id = rival.execute(
+                    """
+                    INSERT INTO forecast_runs
+                      (provider_id,fetched_at,issued_at,document_type,source_url,
+                       document_sha256,status)
+                    VALUES (?,?,?,?,?,?, 'completed')
+                    """,
+                    (
+                        provider_id,
+                        "2026-08-29T02:59:59+00:00",
+                        document.issued_at,
+                        document.document_type,
+                        "https://example.invalid/rival.json",
+                        document.sha256,
+                    ),
+                ).lastrowid
+                rival.execute(
+                    """
+                    INSERT INTO forecasts
+                      (forecast_run_id,forecast_area_id,target_start,target_end,
+                       forecast_type,weather_code)
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    (
+                        rival_run_id,
+                        area_id,
+                        "2026-08-29T15:00:00+00:00",
+                        "2026-08-30T15:00:00+00:00",
+                        "weather_daily",
+                        "201",
+                    ),
+                )
+            return parse_document(*args)
+
+        try:
+            with patch(
+                "weatherdb.forecast_fetch.parse_document",
+                side_effect=complete_in_rival_then_parse,
+            ):
+                result = self.run_fetch(raw)
+        finally:
+            rival.close()
+
+        self.assertEqual((result.completed_runs, result.skipped_documents), (0, 1))
+        self.assertIsNone(result.raw_file_path)
+        self.assertEqual(
+            self.connection.execute(
+                """SELECT COUNT(*) FROM forecast_runs
+                   WHERE document_sha256=? AND status='completed'""",
+                (document.sha256,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM forecast_runs WHERE status='started'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0],
+            1,
+        )
+
+    def test_mixed_duplicate_and_new_document_keeps_shared_raw(self) -> None:
+        self.run_fetch(fixture("forecast_short_0500.json"))
+        mixed_raw = documents("forecast_short_0500.json", "forecast_weekly.json")
+        result = self.run_fetch(mixed_raw, "2026-08-29T04:00:00+00:00")
+        self.assertEqual((result.completed_runs, result.skipped_documents), (1, 1))
+        self.assertIsNotNone(result.raw_file_path)
+        self.assertTrue(result.raw_file_path.is_file())
+        weekly_path = self.connection.execute(
+            "SELECT raw_file_path FROM forecast_runs WHERE document_type='weekly'"
+        ).fetchone()[0]
+        self.assertEqual(weekly_path, str(result.raw_file_path))
+
+    def test_duplicate_raw_cleanup_failure_is_reported_and_audited(self) -> None:
+        raw = fixture("forecast_short_1700.json")
+        self.run_fetch(raw)
+        with patch.object(Path, "unlink", side_effect=PermissionError("locked")):
+            with self.assertRaisesRegex(ForecastFetchError, "削除できません"):
+                self.run_fetch(raw, "2026-08-29T04:00:00+00:00")
+        failed = self.connection.execute(
+            """SELECT status,error_message,raw_file_path FROM forecast_runs
+               WHERE status='failed' ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        self.assertIn("削除できません", failed[1])
+        self.assertTrue(Path(failed[2]).is_file())
 
     def test_db_failure_rolls_back_partial_forecasts_and_marks_failed(self) -> None:
         original = identify_documents(decode_forecast_json(fixture("forecast_short_1700.json")))[0]
@@ -297,6 +568,13 @@ class HttpRawAndCliTests(Phase2Base):
                 success = main(["--db", str(self.db_path), "fetch-forecast", "--raw-dir", str(self.raw_dir)])
         self.assertEqual(success, 0)
         self.assertIn("completed run数: 1", stdout.getvalue())
+        duplicate_stdout = io.StringIO()
+        with patch("weatherdb.forecast_fetch.urlopen", return_value=FakeResponse(fixture("forecast_short_1700.json"))):
+            with contextlib.redirect_stdout(duplicate_stdout):
+                duplicate = main(["--db", str(self.db_path), "fetch-forecast", "--raw-dir", str(self.raw_dir)])
+        self.assertEqual(duplicate, 0)
+        self.assertIn("raw保存先: -（全文書がcompleted済み", duplicate_stdout.getvalue())
+        self.assertIn("重複skip文書数: 1", duplicate_stdout.getvalue())
         stderr = io.StringIO()
         with patch("weatherdb.forecast_fetch.urlopen", side_effect=TimeoutError("timed out")):
             with contextlib.redirect_stderr(stderr):

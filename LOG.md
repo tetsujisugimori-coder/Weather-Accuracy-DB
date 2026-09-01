@@ -142,3 +142,55 @@
 - 気象庁表示用JSONの構造変更時はparserとfixture更新が必要。
 - システムPythonには`pip`がないため、wheel検証は標準venv内で実施した。実行時機能にはpipも外部依存も不要。
 - 観測値取得、予報と実測の対応付け、降水分析、気温誤差、calibration、Web UIはPhase 3以降。
+
+## 2026-09-01 — PR #4 retry・raw整理・INDEX修正
+
+### 原因と修正内容
+
+- `forecast_runs.document_sha256`のUNIQUE INDEXと重複検索がstatusを区別していなかったため、`failed`または異常終了後の`started`が同じ文書の再試行を永久に阻害していた。
+- 文書hashのUNIQUE INDEXを`status = 'completed'`だけに適用する部分UNIQUE INDEXへ変更し、重複判定もcompletedだけを対象にした。failed・startedは監査履歴として残したまま、別runで再試行する。
+- forecast INSERTとcompleted更新は引き続き同じtransactionで行う。completed更新時にも既存completedを確認し、同時実行で別runが先にcompletedになった場合は競合側をrollbackしてskipする。部分forecastと同一文書の複数completedを残さない。
+- raw保存後に全文書がcompleted済みと判定された場合、DBから参照されない今回のrawだけを削除し、`FetchSummary.raw_file_path`をNULLにする。短期・週間の一方が新規・再試行・failedなら共通rawは保持する。
+- raw削除に失敗した場合は無言で継続せず、残ったrawを参照するfailed runを監査記録として作成して通常エラーを返す。ファイルが既に存在しない場合は、存在しないパスを記録しない。
+- `status`の表示名を「最新保存run取得日時」へ変更し、HTTP試行時刻ではなく最新の保存済みrunの`fetched_at`であることをREADMEへ明記した。
+- `forecasts(forecast_run_id)`の通常INDEX `idx_forecasts_run`を追加した。区域・地点別の部分UNIQUE INDEXは維持した。
+- READMEのwheel例を`weather_accuracy_db-0.2.0-py3-none-any.whl`へ修正した。
+
+### スキーマ互換性の判断
+
+- 旧Phase 1 DBを自動変更しない方針は維持した。
+- PR #4初期版のPhase 2 DBはテーブル変更を伴わないINDEX修正だけで安全に更新できるため、`init`再実行で旧文書INDEXをdrop/recreateし、run INDEXを追加できるようにした。通常の取得処理は必要なINDEXがない場合に`init`再実行を案内する。
+
+### 追加・変更テスト
+
+- parser失敗後の同一JSON再試行、failed履歴保持、成功後の重複skip。
+- 残存started runが同一JSONの再試行を阻害しないこと。
+- completed競合で片側をrollbackし、completedが1件だけになること。
+- 全文書重複時の未参照raw削除、CLIの削除済みパス非表示。
+- 短期重複・週間新規の混在時に共通rawを保持すること。
+- parser失敗時にfailed runからrawを参照できること。
+- raw削除失敗のエラー通知と監査run。
+- `PRAGMA index_list/index_info`と`EXPLAIN QUERY PLAN`によるrun INDEX確認、初期Phase 2 INDEXの`init`更新。
+- wheelファイル名がバージョン`0.2.0`と一致すること。`.venv`をpackagingテストのリポジトリコピー対象から除外した。
+- 既存60件に8件を追加し、合計68件。
+
+### 実行コマンドと結果
+
+- `python -m unittest discover -s tests -v`: 実装テスト67件は成功。システムPython 3.14にpipがないためwheelテスト1件だけ`No module named pip`で失敗した。
+- `.venv\\Scripts\\python.exe -m unittest discover -s tests -v`: 68件、全件成功。wheel build、隔離install、リポジトリ外CLIも成功。
+- `python -m compileall -q weatherdb tests`: 成功。
+- `python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist`: システムPythonにpipがないため未実行相当の失敗。
+- `.venv\\Scripts\\python.exe -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist`: 成功。生成物は`weather_accuracy_db-0.2.0-py3-none-any.whl`。
+- 新規`data/phase2-retry-test.sqlite3`の`init → import-areas → fetch-forecast → status`: 成功。地域45件、地点11件、completed 2 run、forecast 39件。
+- 同じJSONの2回目取得: completed 0、forecast 0、skip 2。runとforecast件数は増えず、rawファイル数も増えなかった。CLIは削除済みrawパスを表示しなかった。
+- `PRAGMA integrity_check`: `ok`。
+- `PRAGMA foreign_key_check`: 0件。
+- completed文書の重複group: 0件。
+- `EXPLAIN QUERY PLAN SELECT * FROM forecasts WHERE forecast_run_id = ?`: `idx_forecasts_run`の利用を確認。
+
+### 残っている制約
+
+- 気象庁表示用JSONの構造変更時はparserとfixture更新が必要。
+- システムPythonにはpipがないため、wheelを含む完全な検証は既存venvで実施した。実行時の外部Python依存は追加していない。
+- HTTP取得試行自体は履歴化せず、保存された文書runだけを履歴化する。全文書重複時の取得時刻はstatusへ反映しない。
+- 観測値取得、精度分析、calibration、Web UIはPhase 3以降。

@@ -36,7 +36,7 @@ wheelのビルド時だけは`pyproject.toml`に記載した`setuptools>=68`が�
 
 ```powershell
 python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
-python -m pip install .\dist\weather_accuracy_db-0.1.0-py3-none-any.whl
+python -m pip install .\dist\weather_accuracy_db-0.2.0-py3-none-any.whl
 
 New-Item -ItemType Directory -Path C:\weatherdb-work -Force
 Set-Location C:\weatherdb-work
@@ -88,7 +88,7 @@ python -m weatherdb --db .\data\weather.sqlite3 fetch-forecast
 
 既定URLは <https://www.jma.go.jp/bosai/forecast/data/forecast/140000.json>、既定timeoutは20秒、raw保存先は実行時カレントディレクトリの `raw/jma/forecasts/` です。検証時だけ `--url`、`--raw-dir`、`--timeout` を変更できます。User-Agentを明示し、timeout、HTTP status、接続、空レスポンス、decode、構造エラーを通常エラーとして扱います。
 
-成功時はraw保存先、処理文書数、completed run数、保存forecast数、重複skip文書数を表示します。通信・JSON・DBの通常エラーは終了コード1で、Tracebackは表示しません。
+成功時はraw保存先、処理文書数、completed run数、保存forecast数、重複skip文書数を表示します。全文書がcompleted済みだった場合、未参照の新規rawを削除し、raw保存先には削除したファイルパスではなく`-`を表示します。通信・JSON・DB・raw整理の通常エラーは終了コード1で、Tracebackは表示しません。
 
 ### 短期・週間文書と予報対象
 
@@ -118,11 +118,17 @@ HTTPレスポンスの元bytesを整形し直さず、一時ファイルへ書�
 
 `raw_file_path`は、`--raw-dir`が任意の場所を指せ、別のカレントディレクトリからも一意に解決できるよう絶対パスで保存します。`raw_file_sha256`はHTTPレスポンス全体の元bytes、`document_sha256`は短期または週間の文書をキー順に正規化したJSONのSHA-256です。Phase 1の`content_sha256`は旧テスト・手動データとの互換列で、Phase 2取得処理は使用しません。
 
-同じ`document_sha256`を再取得した場合は既存runを維持してskipします。一方、対象日が同じでも発表日時または文書内容が変われば別runとして追加し、過去予報をUPDATEしません。同じrawファイルを短期・週間の複数runが参照できます。
+同じ`document_sha256`で`completed`のrunがある場合だけskipします。failed runや異常終了で残ったstarted runは監査履歴として維持し、新しいrunで再試行します。再試行が成功した後の取得はskipされ、completed runはprovider・文書hashごとに1件だけです。一方、対象日が同じでも発表日時または文書内容が変われば別runとして追加し、過去予報をUPDATEしません。
+
+rawはdecodeと構造エラーの証跡を残すため、文書判定より先に保存します。新規・再試行・failedのrunが1件でも参照するrawは保持し、短期・週間の一方だけが新規の場合も共通rawを新規runから参照します。全文書がcompleted済みで新規rawを参照するrunがない場合だけ、そのrawを削除します。削除に失敗した場合は、存在するrawをfailed runから参照してエラーを明示し、未管理ファイルとして無言で残しません。
 
 ### run状態と失敗時transaction
 
-文書を識別できたら`started`を記録し、その文書の全forecast INSERTと`completed`への更新を1transactionで実行します。1件でも失敗すればforecast transactionをrollbackし、別transactionでrunを`failed`へ更新して短い`error_message`を残します。decode以前など文書種別・発表日時を特定できない失敗は、両列NULLのfailed runとして記録します。異常終了で`started`が残ることはあり、後続実行が過去runを勝手にcompletedへ変更することはありません。
+文書を識別できたら`started`を記録し、その文書の全forecast INSERTと`completed`への更新を1transactionで実行します。1件でも失敗すればforecast transactionをrollbackし、別transactionでrunを`failed`へ更新して短い`error_message`を残します。decode以前など文書種別・発表日時を特定できない失敗は、両列NULLのfailed runとして記録します。
+
+failed・startedはcompletedの一意性対象外なので、新しい取得は別runとして再試行できます。過去runのstatusや`error_message`は変更しません。同時実行ではcompletedへの更新前にも既存completedを確認し、`status='completed'`限定の部分UNIQUE INDEXを最終防御にします。別処理が先に完了した場合、負けた処理のforecast transactionを全rollbackして重複skipとして扱うため、部分的なforecastや複数completedを残しません。
+
+`status`の「最新保存run取得日時」は、`forecast_runs`へ保存された最新`fetched_at`です。全文書重複でrunを作らなかったHTTP取得は含まず、「最後のHTTP試行時刻」ではありません。
 
 ## SQLite schema概要
 
@@ -135,7 +141,7 @@ HTTPレスポンスの元bytesを整形し直さず、一時ファイルへ書�
 - `observations`: 地点・観測日時ごとの生の降水量・気温。
 - `master_imports`: どの確認日のマスタをimportしたかと、正規化内容のSHA-256を記録。
 
-主キーはすべてSQLiteの整数キーです。JMAコードにはproviderとの複合UNIQUE制約を置きます。文書の再取込は`forecast_runs(provider_id, document_sha256)`、同一run内の区域・地点予報重複はそれぞれの自然キー、観測重複は`(station_id, observed_at)`で防ぎます。
+主キーはすべてSQLiteの整数キーです。JMAコードにはproviderとの複合UNIQUE制約を置きます。completed文書の再取込は`forecast_runs(provider_id, document_sha256) WHERE status='completed'`、同一run内の区域・地点予報重複はそれぞれの自然キー、観測重複は`(station_id, observed_at)`で防ぎます。
 
 スキーマ全文はパッケージ内の [weatherdb/resources/schema.sql](weatherdb/resources/schema.sql)、Phase 1のSQL例は [sql/queries.sql](sql/queries.sql) を参照してください。
 
@@ -151,6 +157,8 @@ python -m weatherdb status
 ```
 
 必要なユーザーデータが入っている場合は削除せず、バックアップを保持してください。
+
+PR #4初版のPhase 2 DBは列構成が同じため、バックアップ後に`init`を再実行すると、文書一意INDEXをcompleted限定へ安全に置き換え、run検索INDEXを追加します。`fetch-forecast`は古いINDEX構成を検出した場合、先に`init`を求めます。
 
 ## 時刻の扱い
 
@@ -170,7 +178,7 @@ Phase 2では、取得時刻と種別を含む名前で`raw/jma/forecasts/`以�
 
 各接続で `PRAGMA foreign_keys = ON` と5秒のbusy timeoutを設定します。WALは、将来の定期取得中にも読み取り分析しやすく、異常終了時の耐性も得やすいため採用しています。代わりに `-wal` / `-shm` ファイルが生じ、ネットワーク共有には向かないため、DBはローカルディスクで使ってください。
 
-日時、予報区域、地域親子関係と中間テーブルの検索に必要なINDEXだけを定義しています。現役の地点―区域関係には`idx_station_memberships_active`部分UNIQUE INDEXを使います。`forecasts.forecast_run_id` と `observations.station_id` は、それぞれ先頭列に含むUNIQUE制約のSQLite自動INDEXを利用するため、重複する単一列INDEXは作りません。`sql/queries.sql` に `EXPLAIN QUERY PLAN` の例があります。
+日時、予報区域、地域親子関係と中間テーブルの検索に必要なINDEXだけを定義しています。現役の地点―区域関係には`idx_station_memberships_active`部分UNIQUE INDEXを使います。区域・地点別のforecast自然キーINDEXは部分INDEXなので、`WHERE forecast_run_id = ?`だけの検索には利用できません。このため`idx_forecasts_run`を別に定義しています。`observations.station_id`は`UNIQUE(station_id, observed_at)`のSQLite自動INDEX先頭列を利用します。`sql/queries.sql`に`EXPLAIN QUERY PLAN`の例があります。
 
 ## テストとDB検証
 

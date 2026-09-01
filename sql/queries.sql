@@ -91,3 +91,10 @@ JOIN forecast_runs AS run ON run.id = forecast.forecast_run_id
 LEFT JOIN forecast_areas AS area ON area.id = forecast.forecast_area_id
 LEFT JOIN observation_stations AS station ON station.id = forecast.station_id
 ORDER BY forecast.target_start, run.issued_at, forecast.id;
+
+-- idx_forecasts_run must support a run-only lookup; the area/station natural
+-- key indexes are partial and cannot satisfy this predicate by themselves.
+EXPLAIN QUERY PLAN
+SELECT *
+FROM forecasts
+WHERE forecast_run_id = 1;
